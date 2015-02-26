@@ -35,7 +35,7 @@ start_link(PubKey, SecKey) ->
 
 init([PubKey, SecKey]) ->
   _Ref = erlang:send_after(60000, self(), rotate),
-  Extension = ecurvecp_messages:extension(self()),
+  Extension = ecurvecp:extension(self()),
   MinuteKey = enacl:randombytes(32),
   PrevMinuteKey = enacl:randombytes(32),
   State = #st{server_long_term_public_key=PubKey,
@@ -50,19 +50,19 @@ hello(<<?HELLO_PKT_PREFIX, SE:16/binary, CE:16/binary,
         Box:80/binary>>, #st{server_extension=SE} = StateData) ->
   #st{server_long_term_secret_key=LongTermSecKey,
       minute_key=MinuteKey} = StateData,
-  case catch(enacl:box_open(Box, ecurvecp_messages:nonce_string(hello, Nonce),
+  case catch(enacl:box_open(Box, ecurvecp_nonces:nonce_string(hello, Nonce),
                             ClientShortTermPubKey, LongTermSecKey)) of
     {ok, _Zeros} ->
       #{public := ShortTermPubKey, secret := ShortTermSecKey} = enacl:box_keypair(),
-      N = enacl:randombytes(16),
-      NonceString = ecurvecp_messages:nonce_string(cookie, N),
+      CookieNonce = ecurvecp_nonces:long_term_nonce_counter(LongTermSecKey),
+      NonceString = ecurvecp_nonces:nonce_string(cookie, CookieNonce),
       Cookie = encode_cookie(ClientShortTermPubKey, ShortTermPubKey, MinuteKey),
       BoxMsg = <<ShortTermPubKey/binary, Cookie/binary>>,
       CookieBox = enacl:box(BoxMsg, NonceString, ClientShortTermPubKey, LongTermSecKey),
       CookieMsg = <<?COOKIE_PKT_PREFIX, CE/binary, SE/binary,
-                    N/binary, CookieBox/binary>>,
+                    CookieNonce/binary, CookieBox/binary>>,
 
-      ClientPid = ecurvecp_messages:extension_pid(CE),
+      ClientPid = ecurvecp:extension_pid(CE),
       ok = reply(ClientPid, CookieMsg),
       {next_state, initiate, StateData#st{cookie=Cookie,
                                           client_extension=CE,
@@ -79,7 +79,7 @@ initiate(<<?INITIATE_PKT_PREFIX, SE:16/binary, CE:16/binary, ClientShortTermPubK
          #st{cookie=Cookie, server_extension=SE, client_extension=CE} = StateData) ->
   #st{server_short_term_secret_key=ServerShortTermSecKey,
      client_pid=ClientPid} = StateData,
-  case enacl:box_open(InitiateBox, ecurvecp_messages:nonce_string(initiate, InitiateNonce), ClientShortTermPubKey, ServerShortTermSecKey) of
+  case enacl:box_open(InitiateBox, ecurvecp_nonces:nonce_string(initiate, InitiateNonce), ClientShortTermPubKey, ServerShortTermSecKey) of
     {ok, <<ClientLongTermPubKey:32/binary, _Vouch:64/binary, _DomainName:256/binary, _Message/binary>>} ->
       Reply = encode_server_message(<<"CurveCPM">>, ClientShortTermPubKey,
                                       ServerShortTermSecKey),
@@ -100,7 +100,7 @@ message(<<?CLIENT_MESSAGE_PKT_PREFIX, SE:16/binary, CE:16/binary, MessageNonce:8
   #st{client_short_term_public_key=ClientShortTermPubKey,
       server_short_term_secret_key=ServerShortTermSecKey,
       client_pid=ClientPid} = StateData,
-  MessageNonceString = ecurvecp_messages:nonce_string(client_message, MessageNonce),
+  MessageNonceString = ecurvecp_nonces:nonce_string(client_message, MessageNonce),
   case enacl:box_open(MessageBox, MessageNonceString, ClientShortTermPubKey, ServerShortTermSecKey) of
     {ok, Message} ->
       Reply = encode_server_message(Message, ClientShortTermPubKey,
@@ -136,9 +136,9 @@ rotate_minute_keys(StateData) ->
   StateData#st{minute_key=MinuteKey, prev_minute_key=PrevMinuteKey}.
 
 -spec encode_cookie(<<_:32>>, <<_:32>>, <<_:32>>) -> <<_:96>>.
-encode_cookie(ClientShortTermPubKey, ServerShortTermSK, MinuteKey) ->
-  Msg = <<ClientShortTermPubKey/binary, ServerShortTermSK/binary>>,
-  Nonce = enacl:randombytes(16),
+encode_cookie(ClientShortTermPubKey, ServerShortTermSecKey, MinuteKey) ->
+  Msg = <<ClientShortTermPubKey/binary, ServerShortTermSecKey/binary>>,
+  Nonce = ecurvecp_nonces:long_term_nonce_timestamp(),
   NonceString = <<"minute-k", Nonce/binary>>,
   Box = enacl:secretbox(Msg, NonceString, MinuteKey),
   <<Nonce/binary, Box/binary>>.
@@ -149,7 +149,8 @@ reply(ClientPid, Msg) ->
 
 -spec encode_server_message(binary(), key(), key()) -> binary().
 encode_server_message(Message, ClientShortTermPubKey, ServerShortTermSecKey) ->
-  {Nonce, NonceString} = ecurvecp_messages:nonce(server_message),
+  Nonce = ecurvecp_nonces:short_term_nonce(ServerShortTermSecKey),
+  NonceString = ecurvecp_nonces:nonce_string(server_message, Nonce),
   Box = enacl:box(Message, NonceString,
-                         ClientShortTermPubKey, ServerShortTermSecKey),
+                  ClientShortTermPubKey, ServerShortTermSecKey),
   <<Nonce/binary, Box/binary>>.

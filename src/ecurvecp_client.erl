@@ -37,8 +37,8 @@ send(ClientPid, Message) ->
   gen_fsm:sync_send_event(ClientPid, {message, Message}, 5000).
 
 init([Server, ServerPublicKey, ClientPubKey, ClientSecKey]) ->
-  ClientExtension = ecurvecp_messages:extension(self()),
-  ServerExtension = ecurvecp_messages:extension(Server),
+  ClientExtension = ecurvecp:extension(self()),
+  ServerExtension = ecurvecp:extension(Server),
   StateData = #st{client_extension=ClientExtension,
                   server_extension=ServerExtension,
                   server_pid=Server,
@@ -74,7 +74,7 @@ cookie(<<?COOKIE_PKT_PREFIX, CE:16/binary, SE:16/binary, CookieNonce:16/binary,
       client_short_term_secret_key=ClientShortTermSecKey,
       client_short_term_public_key=ClientShortTermPubKey,
       server_pid=ServerPid} = StateData,
-  CookieNonceString = ecurvecp_messages:nonce_string(cookie, CookieNonce),
+  CookieNonceString = ecurvecp_nonces:nonce_string(cookie, CookieNonce),
   case enacl:box_open(CookieBox, CookieNonceString,
                       ServerLongTermPubKey, ClientShortTermSecKey) of
     {ok, <<ServerShortTermPubKey:32/binary, Cookie:96/binary>>} ->
@@ -99,15 +99,14 @@ reply(<<?SERVER_MESSAGE_PKT_PREFIX, CE:16/binary, SE:16/binary, MessageNonce:8/b
   #st{server_short_term_public_key=ServerShortTermPubKey,
       client_short_term_secret_key=ClientShortTermSecKey,
       from=From} = StateData,
-  MessageNonceString = ecurvecp_messages:nonce_string(server_message, MessageNonce),
+  MessageNonceString = ecurvecp_nonces:nonce_string(server_message, MessageNonce),
   case enacl:box_open(MessageBox, MessageNonceString, ServerShortTermPubKey, ClientShortTermSecKey) of
     {ok, Message} ->
       _ = case From of
         undefined -> ok;
         _ -> gen_fsm:reply(From, Message)
       end,
-
-      {next_state, message, StateData};
+      {next_state, message, StateData#st{from=undefined}};
     {error, failed_verification} ->
       ok = error_logger:error_msg("Received unverifiable Server Message~n"),
       {stop, failed_verification, StateData}
@@ -121,9 +120,8 @@ message({message, Message}, From, StateData) ->
       server_extension=SE,
       client_extension=CE,
       server_pid=ServerPid} = StateData,
-  {MessageNonce, MessageNonceString} = ecurvecp_messages:nonce(client_message),
-  MessageBox = enacl:box(Message, MessageNonceString, ServerShortTermPubKey, ClientShortTermSecKey),
-  MessagePkt = <<?CLIENT_MESSAGE_PKT_PREFIX, SE/binary, CE/binary, MessageNonce/binary, MessageBox/binary>>,
+  MessageBody = encode_client_message(Message, ServerShortTermPubKey, ClientShortTermSecKey),
+  MessagePkt = <<?CLIENT_MESSAGE_PKT_PREFIX, SE/binary, CE/binary, MessageBody/binary>>,
   ok = gen_fsm:send_event(ServerPid, MessagePkt),
   {next_state, reply, StateData#st{from=From}}.
 
@@ -155,13 +153,15 @@ encode_domain_name() ->
 -spec encode_hello(key(), key()) -> <<_:88>>.
 encode_hello(ServerLongTermPubKey, ClientShortTermSecKey) ->
   Zeros = <<0:512>>,
-  {Nonce, NonceString} = ecurvecp_messages:nonce(hello),
+  Nonce = ecurvecp_nonces:short_term_nonce(ClientShortTermSecKey),
+  NonceString = ecurvecp_nonces:nonce_string(hello, Nonce),
   Box = enacl:box(Zeros, NonceString, ServerLongTermPubKey, ClientShortTermSecKey),
   <<Nonce/binary, Box/binary>>.
 
 -spec encode_vouch(key(), key(), key()) -> <<_:64>>.
 encode_vouch(ClientShortTermPubKey, ServerLongTermPubKey, ClientLongTermSecKey) ->
-  {Nonce, NonceString} = ecurvecp_messages:nonce(vouch),
+  Nonce = ecurvecp_nonces:long_term_nonce_counter(ClientLongTermSecKey),
+  NonceString = ecurvecp_nonces:nonce_string(vouch, Nonce),
   Box = enacl:box(ClientShortTermPubKey, NonceString, ServerLongTermPubKey,
                   ClientLongTermSecKey),
   <<Nonce/binary, Box/binary>>.
@@ -169,7 +169,15 @@ encode_vouch(ClientShortTermPubKey, ServerLongTermPubKey, ClientLongTermSecKey) 
 -spec encode_initiate(key(), key(), key(), <<_:64>>, binary()) -> binary().
 encode_initiate(ClientLongTermPubKey, ServerShortTermPubKey, ClientShortTermSecKey, Vouch, Message) ->
   DomainName = encode_domain_name(),
-  InitiatePlainText = <<ClientLongTermPubKey/binary, Vouch/binary, DomainName/binary, Message/binary>>,
-  {InitiateNonce, InitiateNonceString} = ecurvecp_messages:nonce(initiate),
-  InitiateBox = enacl:box(InitiatePlainText, InitiateNonceString, ServerShortTermPubKey, ClientShortTermSecKey),
-  <<InitiateNonce/binary, InitiateBox/binary>>.
+  PlainText = <<ClientLongTermPubKey/binary, Vouch/binary, DomainName/binary, Message/binary>>,
+  Nonce = ecurvecp_nonces:short_term_nonce(ClientShortTermSecKey),
+  NonceString = ecurvecp_nonces:nonce_string(initiate, Nonce),
+  Box = enacl:box(PlainText, NonceString, ServerShortTermPubKey, ClientShortTermSecKey),
+  <<Nonce/binary, Box/binary>>.
+
+-spec encode_client_message(binary(), key(), key()) -> binary().
+encode_client_message(Message, ServerShortTermPubKey, ClientShortTermSecKey) ->
+  Nonce = ecurvecp_nonces:short_term_nonce(ClientShortTermSecKey),
+  NonceString = ecurvecp_nonces:nonce_string(client_message, Nonce),
+  Box = enacl:box(Message, NonceString, ServerShortTermPubKey, ClientShortTermSecKey),
+  <<Nonce/binary, Box/binary>>.
