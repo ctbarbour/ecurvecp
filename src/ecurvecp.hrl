@@ -1,0 +1,2 @@
+-define(HELLO_MSG_PREFIX, "QvnQ5XlH").
+-define(COOKIE_MSG_PREFIX, "RL3aNMXK").
