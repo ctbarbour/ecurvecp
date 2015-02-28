@@ -7,9 +7,13 @@ export REBAR
 
 DIALYZER_PLT  = .$(PROJECT).plt
 DIALYZER_OPTS ?= -Werror_handling -Wrace_conditions -Wunmatched_returns
-PLT_APPS 		  = erts kernel stdlib sasl crypto
+PLT_APPS 		  = erts kernel stdlib sasl
 
 .PHONY: all deps shell xref doc
+
+DEPS = enacl druuid
+dep_enacl = https://github.com/jlouis/enacl.git master
+dep_druuid = https://github.com/kellymclaughlin/druuid.git master
 
 all: deps compile
 

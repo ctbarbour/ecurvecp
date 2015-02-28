@@ -1,7 +1,7 @@
 -module(ecurvecp_server).
 -behavior(gen_fsm).
 
--export([start_link/1, start_link/2]).
+-export([start_link/3, start_link/4, send/3]).
 -export([init/1, handle_event/3, handle_sync_event/4, handle_info/3,
          code_change/4, terminate/3]).
 -export([hello/2, initiate/2, message/2]).
@@ -20,97 +20,263 @@
     cookie,
     server_extension,
     client_extension,
-    client_pid
+    transport                       = ecurvecp_udp,
+    handshake_ttl                   = 60000,
+    ttl                             = 360000
   }).
 
--type state() :: #st{}.
+start_link(#{public := PK, secret := SK}, Extension, Opts) ->
+  start_link(PK, SK, Extension, Opts).
 
--spec start_link(key_pair()) -> {ok, pid()}.
-start_link(#{public := PubKey, secret := SecKey}) ->
-  start_link(PubKey, SecKey).
+start_link(PK, SK, Extension, Opts) ->
+  Args = [PK, SK, Extension, proplists:unfold(Opts)],
+  gen_fsm:start_link(?MODULE, Args, []).
 
--spec start_link(key(), key()) -> {ok, pid()}.
-start_link(PubKey, SecKey) ->
-  gen_fsm:start_link(?MODULE, [PubKey, SecKey], []).
+box_open(Box, Nonce, PK, SK) ->
+  catch enacl:box_open(Box, Nonce, PK, SK).
 
-init([PubKey, SecKey]) ->
-  _Ref = erlang:send_after(60000, self(), rotate),
-  Extension = ecurvecp:extension(self()),
-  MinuteKey = enacl:randombytes(32),
-  PrevMinuteKey = enacl:randombytes(32),
-  State = #st{server_long_term_public_key=PubKey,
-              server_long_term_secret_key=SecKey,
-              server_extension=Extension,
-              minute_key=MinuteKey,
-              prev_minute_key=PrevMinuteKey},
+box(Box, Nonce, PK, SK) ->
+  enacl:box(Box, Nonce, PK, SK).
+
+secretbox(Box, Nonce, PK) ->
+  enacl:secretbox(Box, Nonce, PK).
+
+keypair() ->
+  enacl:box_keypair().
+
+verify(X, Y) ->
+  case catch(enacl:verify_32(X, Y)) of
+    true ->
+      true;
+    _ ->
+      false
+  end.
+
+generate_minute_key() ->
+  enacl:randombytes(32).
+
+send(ServerPid, From, Packet) ->
+  gen_fsm:send_event(ServerPid, {curvcp, From, Packet}).
+
+validate_recipient(<<CE:16/binary, Rest/binary>>, #st{client_extension=CE} = State) ->
+  {ok, Rest, State};
+validate_recipient(_Packet, StateData) ->
+  {error, unmatched_server_extension, StateData}.
+
+handle_hello_packet(<<CE:16/binary, CSTPK:32/binary, _:64/binary, Nonce:8/binary, Box:80/binary>>, State0) ->
+  State = State0#st{client_extension=CE, client_short_term_public_key=CSTPK},
+  handle_hello_box(Box, Nonce, State);
+handle_hello_packet(_Packet, StateData) ->
+  {error, unmatched_hello_packet, StateData}.
+
+handle_hello_box(Box, Nonce, State) ->
+  #st{server_long_term_secret_key=SLTSK,
+      client_short_term_public_key=CSTPK} = State,
+  NonceString = ecurvecp_nonces:nonce_string(hello, Nonce),
+  case box_open(Box, NonceString, CSTPK, SLTSK) of
+    {ok, Contents} ->
+      verify_hello_box_contents(Contents, State);
+    {_, Reason} ->
+      {error, Reason, State}
+  end.
+
+verify_hello_box_contents(<<First:32/binary, Second:32/binary>>, State) ->
+  Zeros = <<0:256>>,
+  case catch(verify(First, Zeros) andalso verify(Second, Zeros)) of
+    true ->
+      encode_cookie_packet(generate_short_term_keys(State));
+    _ ->
+      {error, invalid_hello_box_contents, State}
+  end;
+verify_hello_box_contents(_Contents, State) ->
+  {error, invalid_hello_box_contents, State}.
+
+generate_short_term_keys(State) ->
+  #{public := SSTPK, secret := SSTSK} = keypair(),
+  State#st{server_short_term_public_key=SSTPK,
+           server_short_term_secret_key=SSTSK}.
+
+encode_cookie_packet(State) ->
+  #st{client_short_term_public_key=CSTPK,
+      server_long_term_secret_key=SLTSK,
+      server_short_term_public_key=SSTPK,
+      minute_key=MK,
+      client_extension=CE,
+      server_extension=SE} = State,
+
+  Nonce = ecurvecp_nonces:long_term_nonce_counter(SLTSK),
+  NonceString = ecurvecp_nonces:nonce_string(cookie, Nonce),
+  Cookie = encode_cookie(CSTPK, SSTPK, MK),
+  PlainText = <<SSTPK/binary, Cookie/binary>>,
+  Box = box(PlainText, NonceString, CSTPK, SLTSK),
+  Packet = <<?COOKIE_PKT, CE/binary, SE/binary, Nonce/binary, Box/binary>>,
+  {ok, Packet, State}.
+
+encode_cookie(ClientShortTermPubKey, ServerShortTermSecKey, MinuteKey) ->
+  Msg = <<ClientShortTermPubKey/binary, ServerShortTermSecKey/binary>>,
+  Nonce = ecurvecp_nonces:long_term_nonce_timestamp(),
+  NonceString = ecurve_nonces:nonce_string(minute_key, Nonce),
+  Box = secretbox(Msg, NonceString, MinuteKey),
+  <<Nonce/binary, Box/binary>>.
+
+handle_initiate_packet(<<CSTPK:32/binary, Cookie:96/binary, Nonce:8/binary, Box/binary>>, State) ->
+  case verify_cookie(Cookie, CSTPK, State) of
+    true ->
+      handle_initiate_box(Box, Nonce, State);
+    false ->
+      {error, invalid_cookie, State}
+  end;
+handle_initiate_packet(_Packet, State) ->
+  {error, invalid_initiate_packet, State}.
+
+verify_cookie(<<Nonce:8/binary, Box/binary>>, CSTPK, State) ->
+  #st{server_short_term_secret_key=SSTSK} = State,
+  NonceString = ecurve_nonces:nonce_string(minute_key, Nonce),
+  case box_open(Box, NonceString, CSTPK, SSTSK) of
+    {ok, <<BoxedCSTPK:32/binary, _:32/binary>>} ->
+      verify(BoxedCSTPK, CSTPK);
+    _ ->
+      false
+  end.
+
+handle_initiate_box(Box, Nonce, State) ->
+  #st{client_short_term_public_key=CSTPK,
+      server_short_term_secret_key=SSTSK} = State,
+  NonceString = ecurvecp_nonces:nonce_string(initiate, Nonce),
+  case box_open(Box, NonceString, CSTPK, SSTSK) of
+    {ok, Contents} ->
+      handle_initiate_box_contents(Contents, State);
+    _ ->
+      {error, invalid_initate_box, State}
+  end.
+
+handle_initiate_box_contents(<<CLTPK:32/binary, Vouch:64/binary, DomainName:256/binary, Message/binary>>, State) ->
+  case verify_vouch(Vouch, State) andalso
+    verify_client(CLTPK, State) andalso
+    verify_domain_name(DomainName, State) of
+    true ->
+      encode_server_message_packet(Message, State);
+    false ->
+      {error, invalid_initiate_box_contents, State}
+  end;
+handle_initiate_box_contents(_Contents, State) ->
+  {error, invalid_initiate_box_contents, State}.
+
+verify_vouch(<<Nonce:16/binary, Box:48/binary>>, State) ->
+  #st{client_short_term_public_key=CSTPK,
+      server_long_term_secret_key=SLTPK} = State,
+  NonceString = ecurvecp_nonces:nonce_string(vouch, Nonce),
+  case box_open(Box, NonceString, CSTPK, SLTPK) of
+    {ok, VouchedCSTPK} ->
+      verify(VouchedCSTPK, CSTPK);
+    _ ->
+      false
+  end;
+verify_vouch(_Vouch, _State) ->
+  false.
+
+verify_client(_CLTPK, _State) ->
+  true.
+
+verify_domain_name(_DomainName, _State) ->
+  true.
+
+encode_server_message_packet(Message, State) ->
+  #st{server_short_term_secret_key=SSTSK,
+      client_short_term_public_key=CSTPK,
+      client_extension=CE,
+      server_extension=SE} = State,
+
+  Nonce = ecurvecp_nonces:short_term_nonce(SSTSK),
+  NonceString = ecurvecp_nonces:nonce_string(server_message, Nonce),
+  Box = box(Message, NonceString, CSTPK, SSTSK),
+  Packet = <<?SERVER_MESSAGE_PKT, CE/binary, SE/binary, Nonce/binary, Box/binary>>,
+  {ok, Packet, State}.
+
+handle_client_message_packet(<<Nonce:8/binary, Box/binary>>, State) ->
+  #st{client_short_term_public_key=CSTPK,
+      server_short_term_secret_key=SSTSK} = State,
+  NonceString = ecurvecp_nonces:nonce_string(client_message, Nonce),
+  case box_open(Box, NonceString, CSTPK, SSTSK) of
+    {ok, Message} ->
+      encode_server_message_packet(Message, State);
+    _ ->
+      {error, invalid_client_message, State}
+  end;
+handle_client_message_packet(_Packet, State) ->
+  {error, invalid_client_message, State}.
+
+parse_opts([], State) ->
+  State;
+parse_opts([{handshake_ttl, HTTL}|Rest], State) ->
+  parse_opts(Rest, State#st{handshake_ttl=HTTL});
+parse_opts([{ttl, TTL}|Rest], State) ->
+  parse_opts(Rest, State#st{ttl=TTL});
+parse_opts([{transport, Transport}|Rest], State) ->
+  parse_opts(Rest, State#st{transport=Transport});
+parse_opts([_|Rest], State) ->
+  parse_opts(Rest, State).
+
+init([PK, SK, Extension, Opts]) ->
+  State = rotate_minute_keys(
+      parse_opts(Opts, #st{server_long_term_public_key=PK,
+                           server_long_term_secret_key=SK,
+                           server_extension=Extension})),
   {ok, hello, State}.
 
-hello(<<?HELLO_PKT_PREFIX, SE:16/binary, CE:16/binary,
-        ClientShortTermPubKey:32/binary, _:64/binary, Nonce:8/binary,
-        Box:80/binary>>, #st{server_extension=SE} = StateData) ->
-  #st{server_long_term_secret_key=LongTermSecKey,
-      minute_key=MinuteKey} = StateData,
-  case catch(enacl:box_open(Box, ecurvecp_nonces:nonce_string(hello, Nonce),
-                            ClientShortTermPubKey, LongTermSecKey)) of
-    {ok, _Zeros} ->
-      #{public := ShortTermPubKey, secret := ShortTermSecKey} = enacl:box_keypair(),
-      CookieNonce = ecurvecp_nonces:long_term_nonce_counter(LongTermSecKey),
-      NonceString = ecurvecp_nonces:nonce_string(cookie, CookieNonce),
-      Cookie = encode_cookie(ClientShortTermPubKey, ShortTermPubKey, MinuteKey),
-      BoxMsg = <<ShortTermPubKey/binary, Cookie/binary>>,
-      CookieBox = enacl:box(BoxMsg, NonceString, ClientShortTermPubKey, LongTermSecKey),
-      CookieMsg = <<?COOKIE_PKT_PREFIX, CE/binary, SE/binary,
-                    CookieNonce/binary, CookieBox/binary>>,
-
-      ClientPid = ecurvecp:extension_pid(CE),
-      ok = reply(ClientPid, CookieMsg),
-      {next_state, initiate, StateData#st{cookie=Cookie,
-                                          client_extension=CE,
-                                          server_short_term_public_key=ShortTermPubKey,
-                                          server_short_term_secret_key=ShortTermSecKey,
-                                          client_pid=ClientPid}};
-    {'EXIT', {badarg, _E}} ->
-      {stop, badarg, StateData}
+hello({curvcp, From, <<?HELLO_PKT, _SE:16/binary, Packet/binary>>}, State0) ->
+  #st{transport=Transport, handshake_ttl=Timeout} = State0,
+  case handle_hello_packet(Packet, State0) of
+    {ok, CookiePacket, State} ->
+      #st{client_extension=CE} = State,
+      ok = gproc:add_local_name({?MODULE, CE}),
+      ok = Transport:reply(From, CookiePacket),
+      {next_state, initiate, State, Timeout};
+    {error, Reason, State} ->
+      {stop, Reason, State}
   end;
-hello(_Event, StateData) ->
- {stop, badarg, StateData}.
+hello(timeout, State) ->
+  {stop, timeout, State};
+hello(_Event, State) ->
+ {stop, badarg, State}.
 
-initiate(<<?INITIATE_PKT_PREFIX, SE:16/binary, CE:16/binary, ClientShortTermPubKey:32/binary, Cookie:96/binary, InitiateNonce:8/binary, InitiateBox/binary>>,
-         #st{cookie=Cookie, server_extension=SE, client_extension=CE} = StateData) ->
-  #st{server_short_term_secret_key=ServerShortTermSecKey,
-     client_pid=ClientPid} = StateData,
-  case enacl:box_open(InitiateBox, ecurvecp_nonces:nonce_string(initiate, InitiateNonce), ClientShortTermPubKey, ServerShortTermSecKey) of
-    {ok, <<ClientLongTermPubKey:32/binary, _Vouch:64/binary, _DomainName:256/binary, _Message/binary>>} ->
-      Reply = encode_server_message(<<"CurveCPM">>, ClientShortTermPubKey,
-                                      ServerShortTermSecKey),
-      ReplyPkt = <<?SERVER_MESSAGE_PKT_PREFIX, CE/binary, SE/binary, Reply/binary>>,
-      ok = reply(ClientPid, ReplyPkt),
-      {next_state, message, StateData#st{client_long_term_public_key=ClientLongTermPubKey,
-                                         client_short_term_public_key=ClientShortTermPubKey}};
-    {error, failed_verification} ->
-      ok = error_logger:error_msg("Received unverifiable Initiate~n"),
-      {stop, failed_verification, StateData}
+initiate({curvecp, From, <<?INITIATE_PKT, _SE:16/binary, Packet/binary>>}, State0) ->
+  #st{transport=Transport, ttl=Timeout} = State0,
+  case validate_recipient(Packet, State0) of
+    {ok, ValidatedPacket, State1} ->
+      case handle_initiate_packet(ValidatedPacket, State1) of
+        {ok, MessagePacket, State} ->
+          ok = Transport:reply(From, MessagePacket),
+          {next_state, message, State, Timeout};
+        {error, Reason, State} ->
+          {stop, Reason, State}
+      end;
+    {error, Reason, State} ->
+      {stop, Reason, State}
   end;
-initiate(_Event, StateData) ->
-  ok = error_logger:error_msg("Received invalid Initiate message~n"),
-  {stop, badarg, StateData}.
+initiate(timeout, State) ->
+  {stop, timeout, State};
+initiate(_Event, State) ->
+  {stop, badarg, State}.
 
-message(<<?CLIENT_MESSAGE_PKT_PREFIX, SE:16/binary, CE:16/binary, MessageNonce:8/binary, MessageBox/binary>>,
-        #st{server_extension=SE, client_extension=CE} = StateData) ->
-  #st{client_short_term_public_key=ClientShortTermPubKey,
-      server_short_term_secret_key=ServerShortTermSecKey,
-      client_pid=ClientPid} = StateData,
-  MessageNonceString = ecurvecp_nonces:nonce_string(client_message, MessageNonce),
-  case enacl:box_open(MessageBox, MessageNonceString, ClientShortTermPubKey, ServerShortTermSecKey) of
-    {ok, Message} ->
-      Reply = encode_server_message(Message, ClientShortTermPubKey,
-                                    ServerShortTermSecKey),
-      ReplyPkt = <<?SERVER_MESSAGE_PKT_PREFIX, CE/binary, SE/binary, Reply/binary>>,
-      ok = reply(ClientPid, ReplyPkt),
-      {next_state, message, StateData};
-    _ ->
-      {stop, badarg, StateData}
-  end.
+message({curvecp, From, <<?CLIENT_MESSAGE_PKT, Packet/binary>>}, State0) ->
+  #st{transport=Transport, ttl=Timeout} = State0,
+  case validate_recipient(Packet, State0) of
+    {ok, ValidatedPacket, State1} ->
+      case handle_client_message_packet(ValidatedPacket, State1) of
+        {ok, MessagePacket, State} ->
+          ok = Transport:reply(From, MessagePacket),
+          {next_state, message, State, Timeout};
+        {error, Reason, State} ->
+          {stop, Reason, State}
+      end;
+    {error, Reason, State} ->
+      {stop, Reason, State}
+  end;
+message(timeout, State) ->
+  {stop, timeout, State};
+message(_Event, State) ->
+  {stop, badarg, State}.
 
 handle_event(_Event, StateName, StateData) ->
   {next_state, StateName, StateData}.
@@ -129,28 +295,11 @@ code_change(_OldVsn, StateName, StateData, _Extra) ->
 terminate(_Reason, _StateName, _StateData) ->
   ok.
 
--spec rotate_minute_keys(state()) -> state().
-rotate_minute_keys(StateData) ->
-  #st{minute_key=PrevMinuteKey} = StateData,
-  MinuteKey = enacl:randombytes(32),
-  StateData#st{minute_key=MinuteKey, prev_minute_key=PrevMinuteKey}.
-
--spec encode_cookie(<<_:32>>, <<_:32>>, <<_:32>>) -> <<_:96>>.
-encode_cookie(ClientShortTermPubKey, ServerShortTermSecKey, MinuteKey) ->
-  Msg = <<ClientShortTermPubKey/binary, ServerShortTermSecKey/binary>>,
-  Nonce = ecurvecp_nonces:long_term_nonce_timestamp(),
-  NonceString = <<"minute-k", Nonce/binary>>,
-  Box = enacl:secretbox(Msg, NonceString, MinuteKey),
-  <<Nonce/binary, Box/binary>>.
-
--spec reply(pid(), binary()) -> ok.
-reply(ClientPid, Msg) ->
-  gen_fsm:send_event(ClientPid, Msg).
-
--spec encode_server_message(binary(), key(), key()) -> binary().
-encode_server_message(Message, ClientShortTermPubKey, ServerShortTermSecKey) ->
-  Nonce = ecurvecp_nonces:short_term_nonce(ServerShortTermSecKey),
-  NonceString = ecurvecp_nonces:nonce_string(server_message, Nonce),
-  Box = enacl:box(Message, NonceString,
-                  ClientShortTermPubKey, ServerShortTermSecKey),
-  <<Nonce/binary, Box/binary>>.
+rotate_minute_keys(#st{minute_key=undefined} = State) ->
+  MinuteKey = generate_minute_key(),
+  rotate_minute_keys(State#st{minute_key=MinuteKey});
+rotate_minute_keys(State) ->
+  #st{minute_key=PrevMinuteKey} = State,
+  MinuteKey = generate_minute_key(),
+  _Ref = erlang:send_after(60000, self(), rotate),
+  State#st{minute_key=MinuteKey, prev_minute_key=PrevMinuteKey}.

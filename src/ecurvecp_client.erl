@@ -11,34 +11,33 @@
 -include("ecurvecp.hrl").
 
 -record(st, {
-    client_long_term_public_key   :: key(),
-    client_long_term_secret_key   :: key(),
-    client_short_term_public_key  :: key(),
-    client_short_term_secret_key  :: key(),
-    server_long_term_public_key   :: key(),
-    server_short_term_public_key  :: key(),
-    cookie                        :: cookie(),
-    client_extension              :: extension(),
-    server_extension              :: extension(),
-    server_pid                    :: pid(),
-    from                          :: {reference(), pid()}
+    client_long_term_public_key,
+    client_long_term_secret_key,
+    client_short_term_public_key,
+    client_short_term_secret_key,
+    server_long_term_public_key,
+    server_short_term_public_key,
+    cookie,
+    client_extension,
+    server_extension,
+    server_pid,
+    from
   }).
 
--spec start_link(pid(), key(), key_pair()) -> {ok, pid()}.
-start_link(Server, ServerPublicKey, #{public := ClientPubKey, secret := ClientSecKey}) ->
-  start_link(Server, ServerPublicKey, ClientPubKey, ClientSecKey).
+start_link(#{public := CLTPK, secret := CLTSK}) ->
+  start_link(CLTPK, CLTSK).
 
--spec start_link(pid(), key(), key(), key()) -> {ok, pid()}.
-start_link(Server, ServerPublicKey, ClientPublicKey, ClientSecretKey) ->
-  gen_fsm:start_link(?MODULE, [Server, ServerPublicKey, ClientPublicKey, ClientSecretKey], []).
+start_link(CLTPK, CLTSK) ->
+  gen_fsm:start_link(?MODULE, [CLTPK, CLTSK], []).
 
--spec send(pid(), term()) -> term().
+open(ClientPid, Ip, Port, Extension, SLTPK) ->
+  gen_fsm:send_event(ClientPid, {connect, Ip, Port, Extension, SLTPK}).
+
 send(ClientPid, Message) ->
   gen_fsm:sync_send_event(ClientPid, {message, Message}, 5000).
 
-init([Server, ServerPublicKey, ClientPubKey, ClientSecKey]) ->
-  ClientExtension = ecurvecp:extension(self()),
-  ServerExtension = ecurvecp:extension(Server),
+init([CLTPK, CLTSK]) ->
+  ClientExtension = ecurvecp:extension(),
   StateData = #st{client_extension=ClientExtension,
                   server_extension=ServerExtension,
                   server_pid=Server,
@@ -55,7 +54,7 @@ start(timeout, StateData) ->
   #{public := ClientShortTermPubKey, secret := ClientShortTermSecKey} = enacl:box_keypair(),
   Hello = encode_hello(ServerLongTermPubKey, ClientShortTermSecKey),
   Zeros = <<0:512>>,
-  HelloMsg = <<?HELLO_PKT_PREFIX, ServerExtension/binary, ClientExtension/binary,
+  HelloMsg = <<?HELLO_PKT, ServerExtension/binary, ClientExtension/binary,
                ClientShortTermPubKey/binary, Zeros/binary, Hello/binary>>,
   ok = gen_fsm:send_event(ServerPid, HelloMsg),
   {next_state, cookie, StateData#st{client_short_term_public_key=ClientShortTermPubKey,
@@ -65,7 +64,7 @@ start(timeout, StateData) ->
 start(_Event, StateData) ->
   {next_state, start, StateData}.
 
-cookie(<<?COOKIE_PKT_PREFIX, CE:16/binary, SE:16/binary, CookieNonce:16/binary,
+cookie(<<?COOKIE_PKT, CE:16/binary, SE:16/binary, CookieNonce:16/binary,
          CookieBox:144/binary>>,
        #st{client_extension=CE, server_extension=SE} = StateData) ->
   #st{server_long_term_public_key=ServerLongTermPubKey,
@@ -80,7 +79,7 @@ cookie(<<?COOKIE_PKT_PREFIX, CE:16/binary, SE:16/binary, CookieNonce:16/binary,
     {ok, <<ServerShortTermPubKey:32/binary, Cookie:96/binary>>} ->
       Vouch = encode_vouch(ClientShortTermPubKey, ServerLongTermPubKey, ClientLongTermSecKey),
       Initiate = encode_initiate(ClientLongTermPubKey, ServerShortTermPubKey, ClientShortTermSecKey, Vouch, <<"CurveCPI">>),
-      InitiateMsg = <<?INITIATE_PKT_PREFIX, SE/binary, CE/binary, ClientShortTermPubKey/binary, Cookie/binary, Initiate/binary>>,
+      InitiateMsg = <<?INITIATE_PKT, SE/binary, CE/binary, ClientShortTermPubKey/binary, Cookie/binary, Initiate/binary>>,
       ok = gen_fsm:send_event(ServerPid, InitiateMsg),
       {next_state, reply, StateData#st{server_short_term_public_key=ServerShortTermPubKey,
                                          cookie=Cookie}};
@@ -94,7 +93,7 @@ cookie(Event, StateData) ->
   ok = error_logger:error_msg("Received unmatched message in state cookie~n~n~p~n~n", [Event]),
   {stop, normal, StateData}.
 
-reply(<<?SERVER_MESSAGE_PKT_PREFIX, CE:16/binary, SE:16/binary, MessageNonce:8/binary, MessageBox/binary>>,
+reply(<<?SERVER_MESSAGE_PKT, CE:16/binary, SE:16/binary, MessageNonce:8/binary, MessageBox/binary>>,
         #st{client_extension=CE, server_extension=SE} = StateData) ->
   #st{server_short_term_public_key=ServerShortTermPubKey,
       client_short_term_secret_key=ClientShortTermSecKey,
@@ -121,7 +120,7 @@ message({message, Message}, From, StateData) ->
       client_extension=CE,
       server_pid=ServerPid} = StateData,
   MessageBody = encode_client_message(Message, ServerShortTermPubKey, ClientShortTermSecKey),
-  MessagePkt = <<?CLIENT_MESSAGE_PKT_PREFIX, SE/binary, CE/binary, MessageBody/binary>>,
+  MessagePkt = <<?CLIENT_MESSAGE_PKT, SE/binary, CE/binary, MessageBody/binary>>,
   ok = gen_fsm:send_event(ServerPid, MessagePkt),
   {next_state, reply, StateData#st{from=From}}.
 
@@ -140,7 +139,6 @@ code_change(_OldVsn, StateName, StateData, _Extra) ->
 terminate(_Reason, _StateName, _StateData) ->
   ok.
 
--spec encode_domain_name() -> <<_:256>>.
 encode_domain_name() ->
   Bin = list_to_binary(?SERVER_DOMAIN),
   case (256 - size(Bin) rem 256) rem 256 of
@@ -150,7 +148,6 @@ encode_domain_name() ->
       <<Bin/binary, 0:(N*8)>>
   end.
 
--spec encode_hello(key(), key()) -> <<_:88>>.
 encode_hello(ServerLongTermPubKey, ClientShortTermSecKey) ->
   Zeros = <<0:512>>,
   Nonce = ecurvecp_nonces:short_term_nonce(ClientShortTermSecKey),
@@ -158,7 +155,6 @@ encode_hello(ServerLongTermPubKey, ClientShortTermSecKey) ->
   Box = enacl:box(Zeros, NonceString, ServerLongTermPubKey, ClientShortTermSecKey),
   <<Nonce/binary, Box/binary>>.
 
--spec encode_vouch(key(), key(), key()) -> <<_:64>>.
 encode_vouch(ClientShortTermPubKey, ServerLongTermPubKey, ClientLongTermSecKey) ->
   Nonce = ecurvecp_nonces:long_term_nonce_counter(ClientLongTermSecKey),
   NonceString = ecurvecp_nonces:nonce_string(vouch, Nonce),
@@ -166,7 +162,6 @@ encode_vouch(ClientShortTermPubKey, ServerLongTermPubKey, ClientLongTermSecKey) 
                   ClientLongTermSecKey),
   <<Nonce/binary, Box/binary>>.
 
--spec encode_initiate(key(), key(), key(), <<_:64>>, binary()) -> binary().
 encode_initiate(ClientLongTermPubKey, ServerShortTermPubKey, ClientShortTermSecKey, Vouch, Message) ->
   DomainName = encode_domain_name(),
   PlainText = <<ClientLongTermPubKey/binary, Vouch/binary, DomainName/binary, Message/binary>>,
@@ -175,7 +170,6 @@ encode_initiate(ClientLongTermPubKey, ServerShortTermPubKey, ClientShortTermSecK
   Box = enacl:box(PlainText, NonceString, ServerShortTermPubKey, ClientShortTermSecKey),
   <<Nonce/binary, Box/binary>>.
 
--spec encode_client_message(binary(), key(), key()) -> binary().
 encode_client_message(Message, ServerShortTermPubKey, ClientShortTermSecKey) ->
   Nonce = ecurvecp_nonces:short_term_nonce(ClientShortTermSecKey),
   NonceString = ecurvecp_nonces:nonce_string(client_message, Nonce),
