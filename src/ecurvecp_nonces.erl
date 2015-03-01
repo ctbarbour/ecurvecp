@@ -50,5 +50,5 @@ nonce_string(server_message, <<_:8/binary>> = Nonce) ->
   <<"CurveCP-server-M", Nonce/binary>>;
 nonce_string(client_message, <<_:8/binary>> = Nonce) ->
   <<"CurveCP-client-M", Nonce/binary>>;
-nonce_string(minute_key, Nonce) ->
+nonce_string(minute_key, <<_:16/binary>> = Nonce) ->
   <<"minute-k", Nonce/binary>>.

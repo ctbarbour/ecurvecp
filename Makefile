@@ -43,4 +43,5 @@ dialyze: compile $(DIALYZER_PLT)
 shell: all
 	@$(ERL) \
 		-pa ./ebin -pa ./deps/*/ebin \
-		-boot start_sasl
+		-boot start_sasl \
+		-config ./config/sys.config

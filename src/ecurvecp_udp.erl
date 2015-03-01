@@ -1,20 +1,17 @@
 -module(ecurvecp_udp).
 -behavior(gen_server).
 
--export([start_link/4, reply/2]).
+-export([start_link/3, open/3, send/2, reply/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, code_change/3,
          terminate/2]).
 
 -include("ecurvecp.hrl").
-
--define(TAB, ?MODULE).
 
 -record(st, {
     listen_ip               :: inet:ipaddress(),
     listen_port             :: inet:port_number(),
     socket                  :: inet:socket(),
     server_extension        :: <<_:16>>,
-    keypair                 :: #{public => <<_:32>>, secret => <<_:32>>},
     pending       = 0       :: non_neg_integer(),
     clients       = 0       :: non_neg_integer(),
     max_clients   = 100     :: pos_integer(),
@@ -23,30 +20,35 @@
     pending_ttl   = 6000    :: pos_integer()
   }).
 
-start_link(Ip, Port, Extension, KeyPair) ->
-  Args = [Ip, Port, Extension, KeyPair],
+start_link(Ip, Port, Extension) ->
+  Args = [Ip, Port, Extension],
   gen_server:start_link({local, ?MODULE}, ?MODULE, Args, []).
 
-reply(To, Reply) ->
-  gen_server:cast(?MODULE, {reply, {To, Reply}}).
+open(Ip, Port, Opts) ->
+  gen_udp:open(Port, [{ip, Ip}|Opts]).
 
-init([Ip, Port, Extension, KeyPair]) ->
-  ?TAB = ets:new(?TAB, [named_tabled, public, ordered_set]),
+reply({Ip, Port}, Packet) ->
+  gen_server:cast(?MODULE, {reply, Ip, Port, Packet}).
+
+send(Socket, Packet) ->
+  gen_udp:send(Socket, Packet).
+
+init([Ip, Port, Extension]) ->
   SocketOpts = case Ip of
     all ->
       [];
     _ ->
       [{ip, Ip}]
-  end ++ [binary, {active, once}, inet, inet6],
+  end ++ [binary, {active, true}, inet, inet6],
   {ok, Socket} = gen_udp:open(Port, SocketOpts),
   State = #st{listen_ip=Ip, listen_port=Port, socket=Socket,
-              keypair=KeyPair, server_extension=Extension},
+              server_extension=Extension},
   {ok, State}.
 
 handle_call(_Msg, _From, State) ->
   {noreply, State}.
 
-handle_cast({reply, {Ip, Port, Packet}}, State) ->
+handle_cast({reply, Ip, Port, Packet}, State) ->
   #st{socket=Socket} = State,
   ok = gen_udp:send(Socket, Ip, Port, Packet),
   {noreply, State};
@@ -66,7 +68,7 @@ handle_info({udp, _, Ip, Port, Packet}, State) ->
       {noreply, State}
   end;
 handle_info(_, State) ->
-  {noreply, State}.
+  {stop, badarg, State}.
 
 code_change(_OldVsn, State, _Extra) ->
   {ok, State}.
@@ -90,8 +92,8 @@ verify_server_extension(_, _) ->
   false.
 
 handle_curvecp_packet(<<?HELLO_PKT, _Rest/binary>> = Packet, From, State) ->
-  {ok, _Pid} = ecurvecp_server_sup:start_server(),
-  ok = ecurvecp_server:send(From, Packet),
+  {ok, Pid} = ecurvecp_server_sup:start_server(),
+  ok = ecurvecp_server:send(Pid, From, Packet),
   {noreply, State};
 handle_curvecp_packet(<<?INITIATE_PKT, _Rest/binary>> = Packet, From, State) ->
   dispatch(Packet, From, State);
@@ -112,5 +114,5 @@ lookup(CE) ->
     {'EXIT', {badarg, _}} ->
       not_found;
     Pid ->
-      Pid
+      {ok, Pid}
   end.
