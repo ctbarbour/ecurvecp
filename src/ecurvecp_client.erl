@@ -63,7 +63,7 @@ generate_short_term_keypair(Codec) ->
 
 init([CLTPK, CLTSK, Owner, Ip, Port, ServerExt, SLTPK]) ->
   ClientExtension = ecurvecp:extension(),
-  SocketOpts = [binary, {active, true}, inet, inet6],
+  SocketOpts = [binary, {active, once}, inet, inet6],
   {ok, Socket} = gen_udp:open(0, SocketOpts),
   Codec = generate_short_term_keypair(#codec{client_extension=ClientExtension,
                                              server_extension=ServerExt,
@@ -229,7 +229,7 @@ terminate(_Reason, _StateName, _StateData) ->
 
 active_once(State) ->
   #st{socket=Socket} = State,
-  ok = inet:setopts(Socket, [{active, true}]),
+  ok = inet:setopts(Socket, [{active, once}]),
   State.
 
 encode_domain_name() ->
