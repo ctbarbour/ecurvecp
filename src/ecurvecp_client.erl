@@ -1,7 +1,7 @@
 -module(ecurvecp_client).
 -behavior(gen_fsm).
 
--export([start_link/5, start_link/6, send/2, stop/1]).
+-export([start_link/6, start_link/7, send/2, stop/1]).
 -export([init/1, handle_event/3, handle_sync_event/4, handle_info/3,
          code_change/4, terminate/3]).
 -export([connect/2, cookie/2, ready/2, message/3]).
@@ -30,14 +30,15 @@
     handshake_ttl = 360000,
     ttl = 60000,
     from,
-    message_count = 0
+    message_count = 0,
+    owner
   }).
 
-start_link(#{public := CLTPK, secret := CLTSK}, Ip, Port, ServerExt, SLTPK) ->
-  start_link(CLTPK, CLTSK, Ip, Port, ServerExt, SLTPK).
+start_link(#{public := CLTPK, secret := CLTSK}, Owner, Ip, Port, ServerExt, SLTPK) ->
+  start_link(CLTPK, CLTSK, Owner, Ip, Port, ServerExt, SLTPK).
 
-start_link(CLTPK, CLTSK, Ip, Port, ServerExt, SLTPK) ->
-  Args = [CLTPK, CLTSK, Ip, Port, ServerExt, SLTPK],
+start_link(CLTPK, CLTSK, Owner, Ip, Port, ServerExt, SLTPK) ->
+  Args = [CLTPK, CLTSK, Owner, Ip, Port, ServerExt, SLTPK],
   gen_fsm:start_link(?MODULE, Args, []).
 
 send(ClientPid, Message) ->
@@ -98,7 +99,7 @@ generate_short_term_keypair(Codec) ->
   Codec#codec{client_short_term_public_key=CSTPK,
                      client_short_term_secret_key=CSTSK}.
 
-init([CLTPK, CLTSK, Ip, Port, ServerExt, SLTPK]) ->
+init([CLTPK, CLTSK, Owner, Ip, Port, ServerExt, SLTPK]) ->
   ClientExtension = ecurvecp:extension(),
   SocketOpts = [binary, {active, true}, inet, inet6],
   {ok, Socket} = gen_udp:open(0, SocketOpts),
@@ -107,7 +108,8 @@ init([CLTPK, CLTSK, Ip, Port, ServerExt, SLTPK]) ->
                                              client_long_term_public_key=CLTPK,
                                              client_long_term_secret_key=CLTSK,
                                              server_long_term_public_key=SLTPK}),
-  State = #st{ip=Ip, port=Port, socket=Socket, codec=Codec},
+  _MRef = erlang:monitor(process, Owner),
+  State = #st{ip=Ip, port=Port, socket=Socket, codec=Codec, owner=Owner},
   {ok, connect, State, 0}.
 
 connect(timeout, State) ->
@@ -247,6 +249,8 @@ handle_info({udp, _, Ip, Port, Packet}, ready, #st{ip=Ip, port=Port} = State) ->
   ready(Packet, active_once(State));
 handle_info({udp, _, Ip, Port, Packet}, message, #st{ip=Ip, port=Port} = State) ->
   message(Packet, active_once(State));
+handle_info({'DOWN', _, process, Owner, _Reason}, _StateName, #st{owner=Owner} = State) ->
+  {stop, owner_down, State};
 handle_info(_Info, StateName, State) ->
   {next_state, StateName, State}.
 
