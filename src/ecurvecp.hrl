@@ -1,5 +1,5 @@
--define(HELLO_PKT, "QvnQ5XlH").
--define(COOKIE_PKT, "RL3aNMXK").
--define(INITIATE_PKT, "QvnQ5XlI").
--define(SERVER_MESSAGE_PKT, "RL3aNMXM").
--define(CLIENT_MESSAGE_PKT, "QvnQ5XlM").
+-define(HELLO, "QvnQ5XlH").
+-define(COOKIE, "RL3aNMXK").
+-define(INITIATE, "QvnQ5XlI").
+-define(SERVER_M, "RL3aNMXM").
+-define(CLIENT_M, "QvnQ5XlM").

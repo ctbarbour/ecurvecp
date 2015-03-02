@@ -28,13 +28,13 @@
     codec
   }).
 
-handle_curvecp_packet(From, <<?HELLO_PKT, Rest/binary>>) ->
+handle_curvecp_packet(From, <<?HELLO, _/binary>> = Packet) ->
   {ok, Pid} = ecurvecp_server_sup:start_server(),
-  gen_fsm:send_event(Pid, {hello, From, Rest});
-handle_curvecp_packet(From, <<?INITIATE_PKT, Exts:32/binary, Rest/binary>>) ->
-  dispatch(Exts, {initiate, From, <<Exts/binary, Rest/binary>>});
-handle_curvecp_packet(From, <<?CLIENT_MESSAGE_PKT, Exts:32/binary, Rest/binary>>) ->
-  dispatch(Exts, {client_message, From, <<Exts/binary, Rest/binary>>}).
+  gen_fsm:send_event(Pid, {hello, From, Packet});
+handle_curvecp_packet(From, <<?INITIATE, Exts:32/binary, _/binary>> = Packet) ->
+  dispatch(Exts, {initiate, From, Packet});
+handle_curvecp_packet(From, <<?CLIENT_M, Exts:32/binary, _/binary>> = Packet) ->
+  dispatch(Exts, {client_message, From, Packet}).
 
 dispatch(<<_SE:16/binary, CE:16/binary>>, Msg) ->
   case lookup(CE) of
@@ -152,7 +152,7 @@ code_change(_OldVsn, StateName, StateData, _Extra) ->
 terminate(_Reason, _StateName, _StateData) ->
   ok.
 
-decode_hello_packet(<<SE:16/binary, CE:16/binary, CSTPK:32/binary,
+decode_hello_packet(<<?HELLO, SE:16/binary, CE:16/binary, CSTPK:32/binary,
                       _Zeros:64/binary, Nonce:8/binary, Box:80/binary>>,
                     Codec) ->
   true = decode_hello_packet_box(Nonce, Box, CSTPK, Codec),
@@ -184,7 +184,7 @@ encode_cookie_packet(Codec) ->
   Cookie = encode_cookie(CSTPK, SSTPK, MK),
   PlainText = <<SSTPK/binary, Cookie/binary>>,
   Box = box(PlainText, NonceString, CSTPK, SLTSK),
-  <<?COOKIE_PKT, CE/binary, SE/binary, Nonce/binary, Box/binary>>.
+  <<?COOKIE, CE/binary, SE/binary, Nonce/binary, Box/binary>>.
 
 encode_cookie(ClientShortTermPubKey, ServerShortTermSecKey, MinuteKey) ->
   Msg = <<ClientShortTermPubKey/binary, ServerShortTermSecKey/binary>>,
@@ -193,8 +193,9 @@ encode_cookie(ClientShortTermPubKey, ServerShortTermSecKey, MinuteKey) ->
   Box = secretbox(Msg, NonceString, MinuteKey),
   <<Nonce/binary, Box/binary>>.
 
-decode_initiate_packet(<<_SE:16/binary, _CE:16/binary, CSTPK:32/binary,
-                         Cookie:96/binary, Nonce:8/binary, Box/binary>>, Codec) ->
+decode_initiate_packet(<<?INITIATE, _SE:16/binary, _CE:16/binary,
+                         CSTPK:32/binary, Cookie:96/binary, Nonce:8/binary,
+                         Box/binary>>, Codec) ->
   true = verify_cookie(Cookie, CSTPK, Codec),
   decode_initiate_box(Nonce, Box, Codec).
 
@@ -245,10 +246,11 @@ encode_server_message_packet(Message, Codec) ->
   Nonce = ecurvecp_nonces:short_term_nonce(SSTSK),
   NonceString = ecurvecp_nonces:nonce_string(server_message, Nonce),
   Box = box(Message, NonceString, CSTPK, SSTSK),
-  <<?SERVER_MESSAGE_PKT, CE/binary, SE/binary, Nonce/binary, Box/binary>>.
+  <<?SERVER_M, CE/binary, SE/binary, Nonce/binary, Box/binary>>.
 
-decode_client_message_packet(<<_SE:16/binary, _CE:16/binary, CSTPK:32/binary,
-                               Nonce:8/binary, Box/binary>>, Codec) ->
+decode_client_message_packet(<<?CLIENT_M, _SE:16/binary, _CE:16/binary,
+                               CSTPK:32/binary, Nonce:8/binary, Box/binary>>,
+                             Codec) ->
   #codec{client_short_term_public_key=CSTPK,
          server_short_term_secret_key=SSTSK} = Codec,
   NonceString = ecurvecp_nonces:nonce_string(client_message, Nonce),

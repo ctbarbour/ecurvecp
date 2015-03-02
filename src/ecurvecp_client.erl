@@ -4,7 +4,7 @@
 -export([start_link/6, start_link/7, send/2, stop/1]).
 -export([init/1, handle_event/3, handle_sync_event/4, handle_info/3,
          code_change/4, terminate/3]).
--export([connect/2, cookie/2, ready/2, message/3]).
+-export([connect/2, cookie/2, ready/2, message/2, message/3]).
 
 -define(SERVER_DOMAIN, "apple.com").
 
@@ -19,7 +19,8 @@
     server_short_term_public_key,
     cookie,
     client_extension,
-    server_extension
+    server_extension,
+    message_count = 0
   }).
 
 -record(st, {
@@ -30,7 +31,6 @@
     handshake_ttl = 360000,
     ttl = 60000,
     from,
-    message_count = 0,
     owner
   }).
 
@@ -54,45 +54,7 @@ box(Box, Nonce, PK, SK) ->
   enacl:box(Box, Nonce, PK, SK).
 
 box_open(Box, Nonce, PK, SK) ->
-  catch enacl:box_open(Box, Nonce, PK, SK).
-
-encode_hello_packet(Codec) ->
-  #codec{server_long_term_public_key=SLTPK,
-                client_short_term_public_key=CSTPK,
-                client_short_term_secret_key=CSTSK,
-                server_extension=SE,
-                client_extension=CE} = Codec,
-
-  Zeros = <<0:512>>,
-  Nonce = ecurvecp_nonces:short_term_nonce(CSTSK),
-  NonceString = ecurvecp_nonces:nonce_string(hello, Nonce),
-  Box = box(Zeros, NonceString, SLTPK, CSTSK),
-  <<?HELLO_PKT, SE/binary, CE/binary, CSTPK/binary, Zeros/binary, Nonce/binary, Box/binary>>.
-
-encode_initiate_packet(Codec) ->
-  #codec{server_short_term_public_key=SSTPK,
-                client_long_term_public_key=CLTPK,
-                client_short_term_public_key=CSTPK,
-                client_short_term_secret_key=CSTSK,
-                server_extension=SE,
-                client_extension=CE,
-                cookie=Cookie} = Codec,
-  Vouch = encode_vouch(Codec),
-  DomainName = encode_domain_name(),
-  PlainText = <<CLTPK/binary, Vouch/binary, DomainName/binary, "CurveCPI">>,
-  Nonce = ecurvecp_nonces:short_term_nonce(CSTSK),
-  NonceString = ecurvecp_nonces:nonce_string(initiate, Nonce),
-  Box = box(PlainText, NonceString, SSTPK, CSTSK),
-  <<?INITIATE_PKT, SE/binary, CE/binary, CSTPK/binary, Cookie/binary, Nonce/binary, Box/binary>>.
-
-encode_vouch(Codec) ->
-  #codec{client_short_term_public_key=CSTPK,
-                server_long_term_public_key=SLTPK,
-                client_long_term_secret_key=CLTSK} = Codec,
-  Nonce = ecurvecp_nonces:long_term_nonce_counter(CLTSK),
-  NonceString = ecurvecp_nonces:nonce_string(vouch, Nonce),
-  Box = box(CSTPK, NonceString, SLTPK, CLTSK),
-  <<Nonce/binary, Box/binary>>.
+  enacl:box_open(Box, Nonce, PK, SK).
 
 generate_short_term_keypair(Codec) ->
   #{public := CSTPK, secret := CSTSK} = keypair(),
@@ -118,122 +80,41 @@ connect(timeout, State) ->
   ok = gen_udp:send(Socket, Ip, Port, Packet),
   {next_state, cookie, State, Timeout}.
 
-verify_extensions(<<MaybeCE:16/binary, MaybeSE:16/binary>>, Codec) ->
-  #codec{client_extension=CE, server_extension=SE} = Codec,
-  MaybeCE =:= CE andalso MaybeSE =:= SE.
-
-decode_cookie_packet(<<?COOKIE_PKT, Exts:32/binary, Rest/binary>>, Codec) ->
-  case verify_extensions(Exts, Codec) of
-    true ->
-      decode_cookie_body(Rest, Codec);
-    false ->
-      {error, invalid_cookie_extensions, Codec}
-  end.
-
-decode_cookie_body(<<Nonce:16/binary, Box:144/binary>>, Codec) ->
-  #codec{server_long_term_public_key=SLTPK,
-         client_short_term_secret_key=CSTSK} = Codec,
-  NonceString = ecurvecp_nonces:nonce_string(cookie, Nonce),
-  case box_open(Box, NonceString, SLTPK, CSTSK) of
-    {ok, Contents} ->
-      decode_cookie_box_contents(Contents, Codec);
-    _ ->
-      {error, invalid_cookie_box, Codec}
-  end.
-
-decode_cookie_box_contents(<<SSTPK:32/binary, Cookie:96/binary>>, Codec) ->
-  {ok, Codec#codec{server_short_term_public_key=SSTPK, cookie=Cookie}};
-decode_cookie_box_contents(_Contents, Codec) ->
-  {error, invalid_cookie_box_contents, Codec}.
-
-decode_server_message_packet(<<?SERVER_MESSAGE_PKT, Exts:32/binary, Rest/binary>>, Codec) ->
-  case verify_extensions(Exts, Codec) of
-    true ->
-      decode_server_message_body(Rest, Codec);
-    false ->
-      {error, invalid_server_message_extensions}
-  end.
-
-decode_server_message_body(<<Nonce:8/binary, Box/binary>>, Codec) ->
-  #codec{server_short_term_public_key=SSTPK,
-         client_short_term_secret_key=CSTSK} = Codec,
-  NonceString = ecurvecp_nonces:nonce_string(server_message, Nonce),
-  case box_open(Box, NonceString, SSTPK, CSTSK) of
-    {ok, Contents} ->
-      {ok, Contents, Codec};
-    {_, Reason} ->
-      {error, Reason}
-  end.
-
-cookie(<<?COOKIE_PKT, _Rest/binary>> = Packet, State) ->
-  #st{codec=Codec0, socket=Socket, ip=Ip, port=Port} = State,
-  case decode_cookie_packet(Packet, Codec0) of
-    {ok, Codec} ->
-      InitiatePacket = encode_initiate_packet(Codec),
-      ok = gen_udp:send(Socket, Ip, Port, InitiatePacket),
-      {next_state, ready, State#st{codec=Codec}};
-    {error, Reason} ->
-      {stop, Reason, State}
-  end;
+cookie(<<?COOKIE, _/binary>> = Packet, State) ->
+  #st{socket=Socket, ip=Ip, port=Port} = State,
+  Codec = decode_cookie_packet(Packet, State#st.codec),
+  InitiatePacket = encode_initiate_packet(Codec),
+  ok = gen_udp:send(Socket, Ip, Port, InitiatePacket),
+  {next_state, ready, State#st{codec=Codec}};
 cookie(timeout, State) ->
-  {stop, handshake_timeout, State};
-cookie(_Event, State) ->
-  {stop, badarg, State}.
+  {stop, handshake_timeout, State}.
 
-ready(<<?SERVER_MESSAGE_PKT, _Rest/binary>> = Packet, State) ->
-  #st{codec=Codec0} = State,
-  case decode_server_message_packet(Packet, Codec0) of
-    {ok, _Message, Codec} ->
-      {next_state, message, State#st{codec=Codec}};
-    {error, Reason} ->
-      {stop, Reason, State}
-  end;
-ready(_Event, State) ->
-  {stop, badarg, State}.
+ready(<<?SERVER_M, _/binary>> = Packet, State) ->
+  #st{ttl=Timeout} = State,
+  {ok, _Message, Codec} = decode_server_message_packet(Packet, State#st.codec),
+  {next_state, message, State#st{codec=Codec}, Timeout};
+ready(timeout, State) ->
+  {stop, handshake_timeout, State}.
 
-message(<<?SERVER_MESSAGE_PKT, _Rest/binary>> = Packet, State) ->
-  #st{codec=Codec0} = State,
-  case decode_server_message_packet(Packet, Codec0) of
-    {ok, Message, Codec} ->
-      _ = reply(Message, State),
-      {next_state, message, State#st{codec=Codec, from=undefined}};
-    {error, Reason} ->
-      {stop, Reason, State}
-  end;
-message(_Event, State) ->
-  {next_state, message, State}.
+message(<<?SERVER_M, _/binary>> = Packet, State) ->
+  #st{ttl=Timeout} = State,
+  {ok, Message, Codec} = decode_server_message_packet(Packet, State#st.codec),
+  _ = reply(Message, State),
+  {next_state, message, State#st{codec=Codec, from=undefined}, Timeout};
+message(timeout, State) ->
+  {stop, timeout, State}.
 
-message({message, PlainText}, From, State0) ->
-  #st{codec=Codec, socket=Socket, ip=Ip, port=Port} = State0,
-  {Message, State} = encode_client_message(PlainText, State0),
+message({message, PlainText}, From, State) ->
+  #st{socket=Socket, ip=Ip, port=Port} = State,
+  {ok, Message, Codec} = encode_client_message(PlainText, State#st.codec),
   Packet = encode_client_message_packet(Message, Codec),
   ok = gen_udp:send(Socket, Ip, Port, Packet),
-  {next_state, message, State#st{from=From}}.
+  {next_state, message, State#st{codec=Codec, from=From}}.
 
 reply(ServerMessage, State) ->
   #st{from=From} = State,
   {_Id, PlainText} = decode_server_message(ServerMessage),
   gen_fsm:reply(From, PlainText).
-
-decode_server_message(<<Id:4/binary, PlainText/binary>>) ->
-  {Id, PlainText}.
-
-encode_client_message_packet(Message, Codec) ->
-  #codec{server_extension=SE,
-         client_extension=CE,
-         client_short_term_public_key=CSTPK,
-         client_short_term_secret_key=CSTSK,
-         server_short_term_public_key=SSTPK} = Codec,
-  Nonce = ecurvecp_nonces:short_term_nonce(CSTSK),
-  NonceString = ecurvecp_nonces:nonce_string(client_message, Nonce),
-  Box = box(Message, NonceString, SSTPK, CSTSK),
-  <<?CLIENT_MESSAGE_PKT, SE/binary, CE/binary, CSTPK/binary, Nonce/binary, Box/binary>>.
-
-encode_client_message(PlainText, State) ->
-  #st{message_count=MC0} = State,
-  MC = MC0 + 1,
-  Message = <<MC:32/unsigned-little-integer, PlainText/binary>>,
-  {Message, State#st{message_count=MC}}.
 
 handle_event(_Event, StateName, StateData) ->
   {next_state, StateName, StateData}.
@@ -253,6 +134,92 @@ handle_info({'DOWN', _, process, Owner, _Reason}, _StateName, #st{owner=Owner} =
   {stop, owner_down, State};
 handle_info(_Info, StateName, State) ->
   {next_state, StateName, State}.
+
+encode_hello_packet(Codec) ->
+  #codec{server_long_term_public_key=SLTPK,
+                client_short_term_public_key=CSTPK,
+                client_short_term_secret_key=CSTSK,
+                server_extension=SE,
+                client_extension=CE} = Codec,
+
+  Zeros = <<0:512>>,
+  Nonce = ecurvecp_nonces:short_term_nonce(CSTSK),
+  NonceString = ecurvecp_nonces:nonce_string(hello, Nonce),
+  Box = box(Zeros, NonceString, SLTPK, CSTSK),
+  <<?HELLO, SE/binary, CE/binary, CSTPK/binary, Zeros/binary, Nonce/binary, Box/binary>>.
+
+verify_extensions(<<MaybeCE:16/binary, MaybeSE:16/binary>>, Codec) ->
+  #codec{client_extension=CE, server_extension=SE} = Codec,
+  MaybeCE =:= CE andalso MaybeSE =:= SE.
+
+decode_cookie_packet(<<?COOKIE, Exts:32/binary, Rest/binary>>, Codec) ->
+  true = verify_extensions(Exts, Codec),
+  decode_cookie_body(Rest, Codec).
+
+decode_cookie_body(<<Nonce:16/binary, Box:144/binary>>, Codec) ->
+  #codec{server_long_term_public_key=SLTPK,
+         client_short_term_secret_key=CSTSK} = Codec,
+  NonceString = ecurvecp_nonces:nonce_string(cookie, Nonce),
+  {ok, Contents} = box_open(Box, NonceString, SLTPK, CSTSK),
+  decode_cookie_box_contents(Contents, Codec).
+
+decode_cookie_box_contents(<<SSTPK:32/binary, Cookie:96/binary>>, Codec) ->
+  Codec#codec{server_short_term_public_key=SSTPK, cookie=Cookie}.
+
+encode_initiate_packet(Codec) ->
+  #codec{server_short_term_public_key=SSTPK,
+                client_long_term_public_key=CLTPK,
+                client_short_term_public_key=CSTPK,
+                client_short_term_secret_key=CSTSK,
+                server_extension=SE,
+                client_extension=CE,
+                cookie=Cookie} = Codec,
+  Vouch = encode_vouch(Codec),
+  DomainName = encode_domain_name(),
+  PlainText = <<CLTPK/binary, Vouch/binary, DomainName/binary, "CurveCPI">>,
+  Nonce = ecurvecp_nonces:short_term_nonce(CSTSK),
+  NonceString = ecurvecp_nonces:nonce_string(initiate, Nonce),
+  Box = box(PlainText, NonceString, SSTPK, CSTSK),
+  <<?INITIATE, SE/binary, CE/binary, CSTPK/binary, Cookie/binary, Nonce/binary, Box/binary>>.
+
+encode_vouch(Codec) ->
+  #codec{client_short_term_public_key=CSTPK,
+                server_long_term_public_key=SLTPK,
+                client_long_term_secret_key=CLTSK} = Codec,
+  Nonce = ecurvecp_nonces:long_term_nonce_counter(CLTSK),
+  NonceString = ecurvecp_nonces:nonce_string(vouch, Nonce),
+  Box = box(CSTPK, NonceString, SLTPK, CLTSK),
+  <<Nonce/binary, Box/binary>>.
+
+encode_client_message_packet(Message, Codec) ->
+  #codec{server_extension=SE,
+         client_extension=CE,
+         client_short_term_public_key=CSTPK,
+         client_short_term_secret_key=CSTSK,
+         server_short_term_public_key=SSTPK} = Codec,
+  Nonce = ecurvecp_nonces:short_term_nonce(CSTSK),
+  NonceString = ecurvecp_nonces:nonce_string(client_message, Nonce),
+  Box = box(Message, NonceString, SSTPK, CSTSK),
+  <<?CLIENT_M, SE/binary, CE/binary, CSTPK/binary, Nonce/binary, Box/binary>>.
+
+encode_client_message(PlainText, Codec) ->
+  MC = Codec#codec.message_count + 1,
+  Message = <<MC:32/unsigned-little-integer, PlainText/binary>>,
+  {ok, Message, Codec#codec{message_count=MC}}.
+
+decode_server_message_packet(<<?SERVER_M, Exts:32/binary, Rest/binary>>, Codec) ->
+  true = verify_extensions(Exts, Codec),
+  decode_server_message_body(Rest, Codec).
+
+decode_server_message_body(<<Nonce:8/binary, Box/binary>>, Codec) ->
+  #codec{server_short_term_public_key=SSTPK,
+         client_short_term_secret_key=CSTSK} = Codec,
+  NonceString = ecurvecp_nonces:nonce_string(server_message, Nonce),
+  {ok, Contents} =  box_open(Box, NonceString, SSTPK, CSTSK),
+  {ok, Contents, Codec}.
+
+decode_server_message(<<Id:4/binary, PlainText/binary>>) ->
+  {Id, PlainText}.
 
 code_change(_OldVsn, StateName, StateData, _Extra) ->
   {ok, StateName, StateData}.
