@@ -65,5 +65,5 @@ terminate(_Reason, _State) ->
 active_once(#st{socket=undefined} = State) ->
   State;
 active_once(#st{socket=Socket} = State) ->
-  ok = inet:setopt(Socket, [{active, once}]),
+  ok = inet:setopts(Socket, [{active, once}]),
   State.

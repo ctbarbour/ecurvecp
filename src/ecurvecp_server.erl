@@ -30,16 +30,16 @@
 
 handle_curvecp_packet(From, <<?HELLO_PKT, Rest/binary>>) ->
   {ok, Pid} = ecurvecp_server_sup:start_server(),
-  gen_fsm:send(Pid, {hello, {Rest, From}});
+  gen_fsm:send_event(Pid, {hello, From, Rest});
 handle_curvecp_packet(From, <<?INITIATE_PKT, Exts:32/binary, Rest/binary>>) ->
-  dispatch(Exts, {initiate, {<<Exts/binary, Rest/binary>>, From}});
+  dispatch(Exts, {initiate, From, <<Exts/binary, Rest/binary>>});
 handle_curvecp_packet(From, <<?CLIENT_MESSAGE_PKT, Exts:32/binary, Rest/binary>>) ->
-  dispatch(Exts, {client_message, {<<Exts/binary, Rest/binary>>, From}}).
+  dispatch(Exts, {client_message, From, <<Exts/binary, Rest/binary>>}).
 
 dispatch(<<_SE:16/binary, CE:16/binary>>, Msg) ->
   case lookup(CE) of
     {ok, ClientPid} ->
-      gen_fsm:send(ClientPid, Msg);
+      gen_fsm:send_event(ClientPid, Msg);
     not_found ->
       ok
   end.
@@ -119,7 +119,7 @@ hello(timeout, State) ->
 initiate({initiate, From, Packet}, State) ->
   #st{handshake_ttl=Timeout, codec=Codec0} = State,
   Codec = decode_initiate_packet(Packet, Codec0),
-  {ok, MessagePacket} = encode_server_message_packet(<<"Welcome">>, Codec),
+  MessagePacket = encode_server_message_packet(<<"Welcome">>, Codec),
   ok = ecurvecp_udp:reply(From, MessagePacket),
   {next_state, message, State#st{codec=Codec}, Timeout};
 initiate(timeout, State) ->
@@ -152,7 +152,7 @@ code_change(_OldVsn, StateName, StateData, _Extra) ->
 terminate(_Reason, _StateName, _StateData) ->
   ok.
 
-decode_hello_packet(<<SE:32/binary, CE:32/binary, CSTPK:32/binary,
+decode_hello_packet(<<SE:16/binary, CE:16/binary, CSTPK:32/binary,
                       _Zeros:64/binary, Nonce:8/binary, Box:80/binary>>,
                     Codec) ->
   true = decode_hello_packet_box(Nonce, Box, CSTPK, Codec),
