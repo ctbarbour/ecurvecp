@@ -8,7 +8,7 @@ start_link() ->
   supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 start_client(Ip, Port, Extension, PublicKey) ->
-  Args = [Ip, Port, Extension, PublicKey],
+  Args = [self(), Ip, Port, Extension, PublicKey],
   supervisor:start_child(?MODULE, Args).
 
 init([]) ->
