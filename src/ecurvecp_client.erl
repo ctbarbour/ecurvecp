@@ -48,33 +48,15 @@ send(ClientPid, Message) ->
 stop(ClientPid) ->
   gen_fsm:sync_send_all_state_event(ClientPid, stop).
 
-keypair() ->
-  enacl:box_keypair().
-
-box(Box, Nonce, PK, SK) ->
-  enacl:box(Box, Nonce, PK, SK).
-
-box_open(Box, Nonce, PK, SK) ->
-  enacl:box_open(Box, Nonce, PK, SK).
-
-box_beforenm(PK, SK) ->
-  enacl:box_beforenm(PK, SK).
-
-box_afternm(Msg, Nonce, K) ->
-  enacl:box_afternm(Msg, Nonce, K).
-
-box_open_afternm(Box, Nonce, K) ->
-  enacl:box_open_afternm(Box, Nonce, K).
-
 generate_short_term_keypair(Codec) ->
-  #{public := CSTPK, secret := CSTSK} = keypair(),
+  #{public := CSTPK, secret := CSTSK} = enacl:box_keypair(),
   Codec#codec{client_short_term_public_key=CSTPK,
               client_short_term_secret_key=CSTSK}.
 
 generate_shared_key(Codec) ->
   #codec{server_short_term_public_key=SSTPK,
          client_short_term_secret_key=CSTSK} = Codec,
-  SharedKey = box_beforenm(SSTPK, CSTSK),
+  SharedKey = enacl:box_beforenm(SSTPK, CSTSK),
   Codec#codec{shared_key=SharedKey}.
 
 init([CLTPK, CLTSK, Owner, Ip, Port, ServerExt, SLTPK]) ->
@@ -106,7 +88,7 @@ cookie(timeout, State) ->
   {stop, handshake_timeout, State}.
 
 ready(<<?SERVER_M, _/binary>> = Packet, State) ->
-  {ok, _Message, Codec} = decode_server_message_packet(Packet, State#st.codec),
+  {ok, _ServerM, Codec} = decode_server_message_packet(Packet, State#st.codec),
   {next_state, finalize, State#st{codec=Codec}, 0};
 ready(timeout, State) ->
   {stop, handshake_timeout, State}.
@@ -165,7 +147,7 @@ encode_hello_packet(Codec) ->
   Zeros = <<0:512>>,
   Nonce = ecurvecp_nonces:short_term_nonce(CSTSK),
   NonceString = ecurvecp_nonces:nonce_string(hello, Nonce),
-  Box = box(Zeros, NonceString, SLTPK, CSTSK),
+  Box = enacl:box(Zeros, NonceString, SLTPK, CSTSK),
   <<?HELLO, SE/binary, CE/binary, CSTPK/binary, Zeros/binary, Nonce/binary, Box/binary>>.
 
 verify_extensions(<<MaybeCE:16/binary, MaybeSE:16/binary>>, Codec) ->
@@ -180,7 +162,7 @@ decode_cookie_body(<<Nonce:16/binary, Box:144/binary>>, Codec) ->
   #codec{server_long_term_public_key=SLTPK,
          client_short_term_secret_key=CSTSK} = Codec,
   NonceString = ecurvecp_nonces:nonce_string(cookie, Nonce),
-  {ok, Contents} = box_open(Box, NonceString, SLTPK, CSTSK),
+  {ok, Contents} = enacl:box_open(Box, NonceString, SLTPK, CSTSK),
   decode_cookie_box_contents(Contents, Codec).
 
 decode_cookie_box_contents(<<SSTPK:32/binary, Cookie:96/binary>>, Codec) ->
@@ -199,7 +181,7 @@ encode_initiate_packet(Codec) ->
   PlainText = <<CLTPK/binary, Vouch/binary, DomainName/binary, "CurveCPI">>,
   Nonce = ecurvecp_nonces:short_term_nonce(CSTSK),
   NonceString = ecurvecp_nonces:nonce_string(initiate, Nonce),
-  Box = box(PlainText, NonceString, SSTPK, CSTSK),
+  Box = enacl:box(PlainText, NonceString, SSTPK, CSTSK),
   <<?INITIATE, SE/binary, CE/binary, CSTPK/binary, Cookie/binary, Nonce/binary, Box/binary>>.
 
 encode_vouch(Codec) ->
@@ -208,7 +190,7 @@ encode_vouch(Codec) ->
                 client_long_term_secret_key=CLTSK} = Codec,
   Nonce = ecurvecp_nonces:long_term_nonce_counter(CLTSK),
   NonceString = ecurvecp_nonces:nonce_string(vouch, Nonce),
-  Box = box(CSTPK, NonceString, SLTPK, CLTSK),
+  Box = enacl:box(CSTPK, NonceString, SLTPK, CLTSK),
   <<Nonce/binary, Box/binary>>.
 
 encode_client_message_packet(Message, Codec) ->
@@ -221,9 +203,9 @@ encode_client_message_packet(Message, Codec) ->
   Nonce = ecurvecp_nonces:short_term_nonce(SharedKey),
   NonceString = ecurvecp_nonces:nonce_string(client_message, Nonce),
   Box = if SharedKey =:= undefined ->
-      box(Message, NonceString, SSTPK, CSTSK);
+      enacl:box(Message, NonceString, SSTPK, CSTSK);
     true ->
-      box_afternm(Message, NonceString, SharedKey)
+      enacl:box_afternm(Message, NonceString, SharedKey)
   end,
   <<?CLIENT_M, SE/binary, CE/binary, CSTPK/binary, Nonce/binary, Box/binary>>.
 
@@ -242,9 +224,9 @@ decode_server_message_body(<<Nonce:8/binary, Box/binary>>, Codec) ->
          shared_key=SharedKey} = Codec,
   NonceString = ecurvecp_nonces:nonce_string(server_message, Nonce),
   {ok, Contents} = if SharedKey =:= undefined ->
-      box_open(Box, NonceString, SSTPK, CSTSK);
+      enacl:box_open(Box, NonceString, SSTPK, CSTSK);
     true ->
-      box_open_afternm(Box, NonceString, SharedKey)
+      enacl:box_open_afternm(Box, NonceString, SharedKey)
   end,
   {ok, Contents, Codec}.
 

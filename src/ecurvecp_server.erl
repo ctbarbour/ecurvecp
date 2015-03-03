@@ -63,44 +63,17 @@ start_link(PK, SK, Extension, Opts) ->
   Args = [PK, SK, Extension, proplists:unfold(Opts)],
   gen_fsm:start_link(?MODULE, Args, []).
 
-box_open(Box, Nonce, PK, SK) ->
-  enacl:box_open(Box, Nonce, PK, SK).
-
-box(Box, Nonce, PK, SK) ->
-  enacl:box(Box, Nonce, PK, SK).
-
-secretbox(Box, Nonce, PK) ->
-  enacl:secretbox(Box, Nonce, PK).
-
-secretbox_open(Box, Nonce, K) ->
-  enacl:secretbox_open(Box, Nonce, K).
-
-box_beforenm(PK, SK) ->
-  enacl:box_beforenm(PK, SK).
-
-box_afternm(Msg, Nonce, K) ->
-  enacl:box_afternm(Msg, Nonce, K).
-
-box_open_afternm(Box, Nonce, K) ->
-  enacl:box_open_afternm(Box, Nonce, K).
-
 generate_shared_key(Codec) ->
   #codec{client_short_term_public_key=CSTPK,
          server_short_term_secret_key=SSTSK} = Codec,
-  SharedKey = box_beforenm(CSTPK, SSTSK),
+  SharedKey = enacl:box_beforenm(CSTPK, SSTSK),
   Codec#codec{shared_key=SharedKey}.
-
-keypair() ->
-  enacl:box_keypair().
-
-verify_32(X, Y) ->
-  enacl:verify_32(X, Y).
 
 generate_minute_key() ->
   enacl:randombytes(32).
 
 generate_short_term_keys(Codec) ->
-  #{public := SSTPK, secret := SSTSK} = keypair(),
+  #{public := SSTPK, secret := SSTSK} = enacl:box_keypair(),
   Codec#codec{server_short_term_public_key=SSTPK,
               server_short_term_secret_key=SSTSK}.
 
@@ -142,9 +115,8 @@ initiate(timeout, State) ->
   {stop, handshake_timeout, State}.
 
 message({client_message, From, Packet}, State) ->
-  #st{codec=Codec0} = State,
-  {ok, ClientMessage, Codec} = decode_client_message_packet(Packet, Codec0),
-  ServerMessagePacket = encode_server_message_packet(ClientMessage, Codec),
+  {ok, ClientM, Codec} = decode_client_message_packet(Packet, State#st.codec),
+  ServerMessagePacket = encode_server_message_packet(ClientM, Codec),
   ok = ecurvecp_udp:reply(From, ServerMessagePacket),
   {next_state, finalize, State#st{codec=Codec}, 0};
 message(timeout, State) ->
@@ -183,12 +155,12 @@ decode_hello_packet(<<?HELLO, SE:16/binary, CE:16/binary, CSTPK:32/binary,
 decode_hello_packet_box(Nonce, Box, CSTPK, Codec) ->
   #codec{server_long_term_secret_key=SLTSK} = Codec,
   NonceString = ecurvecp_nonces:nonce_string(hello, Nonce),
-  {ok, Contents} = box_open(Box, NonceString, CSTPK, SLTSK),
+  {ok, Contents} = enacl:box_open(Box, NonceString, CSTPK, SLTSK),
   verify_hello_box_contents(Contents).
 
 verify_hello_box_contents(<<First:32/binary, Second:32/binary>>) ->
   Zeros = <<0:256>>,
-  verify_32(First, Zeros) andalso verify_32(Second, Zeros);
+  enacl:verify_32(First, Zeros) andalso enacl:verify_32(Second, Zeros);
 verify_hello_box_contents(_Contents) ->
   false.
 
@@ -204,14 +176,14 @@ encode_cookie_packet(Codec) ->
   NonceString = ecurvecp_nonces:nonce_string(cookie, Nonce),
   Cookie = encode_cookie(CSTPK, SSTPK, MK),
   PlainText = <<SSTPK/binary, Cookie/binary>>,
-  Box = box(PlainText, NonceString, CSTPK, SLTSK),
+  Box = enacl:box(PlainText, NonceString, CSTPK, SLTSK),
   <<?COOKIE, CE/binary, SE/binary, Nonce/binary, Box/binary>>.
 
 encode_cookie(ClientShortTermPubKey, ServerShortTermSecKey, MinuteKey) ->
   Msg = <<ClientShortTermPubKey/binary, ServerShortTermSecKey/binary>>,
   Nonce = ecurvecp_nonces:long_term_nonce_timestamp(),
   NonceString = ecurvecp_nonces:nonce_string(minute_key, Nonce),
-  Box = secretbox(Msg, NonceString, MinuteKey),
+  Box = enacl:secretbox(Msg, NonceString, MinuteKey),
   <<Nonce/binary, Box/binary>>.
 
 decode_initiate_packet(<<?INITIATE, _SE:16/binary, _CE:16/binary,
@@ -223,9 +195,9 @@ decode_initiate_packet(<<?INITIATE, _SE:16/binary, _CE:16/binary,
 verify_cookie(<<Nonce:16/binary, Box:80/binary>>, CSTPK, Codec) ->
   #codec{minute_key=MK} = Codec,
   NonceString = ecurvecp_nonces:nonce_string(minute_key, Nonce),
-  case secretbox_open(Box, NonceString, MK) of
+  case enacl:secretbox_open(Box, NonceString, MK) of
     {ok, <<BoxedCSTPK:32/binary, _:32/binary>>} ->
-      verify_32(BoxedCSTPK, CSTPK);
+      enacl:verify_32(BoxedCSTPK, CSTPK);
     _ ->
       false
   end.
@@ -234,7 +206,7 @@ decode_initiate_box(Nonce, Box, Codec) ->
   #codec{client_short_term_public_key=CSTPK,
          server_short_term_secret_key=SSTSK} = Codec,
   NonceString = ecurvecp_nonces:nonce_string(initiate, Nonce),
-  {ok, Contents} = box_open(Box, NonceString, CSTPK, SSTSK),
+  {ok, Contents} = enacl:box_open(Box, NonceString, CSTPK, SSTSK),
   verify_initiate_box_contents(Contents, Codec).
 
 verify_initiate_box_contents(<<CLTPK:32/binary, Vouch:64/binary,
@@ -249,8 +221,8 @@ verify_vouch(CLTPK, <<Nonce:16/binary, Box:48/binary>>, Codec) ->
   #codec{server_long_term_secret_key=SLTPK,
          client_short_term_public_key=CSTPK} = Codec,
   NonceString = ecurvecp_nonces:nonce_string(vouch, Nonce),
-  {ok, VouchedCSTPK} = box_open(Box, NonceString, CLTPK, SLTPK),
-  verify_32(VouchedCSTPK, CSTPK).
+  {ok, VouchedCSTPK} = enacl:box_open(Box, NonceString, CLTPK, SLTPK),
+  enacl:verify_32(VouchedCSTPK, CSTPK).
 
 verify_client(_CLTPK, _Codec) ->
   true.
@@ -269,9 +241,9 @@ encode_server_message_packet(Message, Codec) ->
   NonceString = ecurvecp_nonces:nonce_string(server_message, Nonce),
   Box = if
     SharedKey =:= undefined ->
-      box(Message, NonceString, CSTPK, SSTSK);
+      enacl:box(Message, NonceString, CSTPK, SSTSK);
     true ->
-      box_afternm(Message, NonceString, SharedKey)
+      enacl:box_afternm(Message, NonceString, SharedKey)
   end,
   <<?SERVER_M, CE/binary, SE/binary, Nonce/binary, Box/binary>>.
 
@@ -284,9 +256,9 @@ decode_client_message_packet(<<?CLIENT_M, _SE:16/binary, _CE:16/binary,
   NonceString = ecurvecp_nonces:nonce_string(client_message, Nonce),
   {ok, Message} = if
     SharedKey =:= undefined ->
-      box_open(Box, NonceString, CSTPK, SSTSK);
+      enacl:box_open(Box, NonceString, CSTPK, SSTSK);
     true ->
-      box_open_afternm(Box, NonceString, SharedKey)
+      enacl:box_open_afternm(Box, NonceString, SharedKey)
   end,
   {ok, Message, Codec}.
 
