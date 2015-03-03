@@ -4,7 +4,7 @@
 -export([start_link/6, start_link/7, send/2, stop/1]).
 -export([init/1, handle_event/3, handle_sync_event/4, handle_info/3,
          code_change/4, terminate/3]).
--export([connect/2, cookie/2, ready/2, message/2, message/3]).
+-export([connect/2, cookie/2, ready/2, finalize/2, message/2, message/3]).
 
 -define(SERVER_DOMAIN, "apple.com").
 
@@ -18,6 +18,7 @@
     server_long_term_public_key,
     server_short_term_public_key,
     cookie,
+    shared_key,
     client_extension,
     server_extension,
     message_count = 0
@@ -56,10 +57,25 @@ box(Box, Nonce, PK, SK) ->
 box_open(Box, Nonce, PK, SK) ->
   enacl:box_open(Box, Nonce, PK, SK).
 
+box_beforenm(PK, SK) ->
+  enacl:box_beforenm(PK, SK).
+
+box_afternm(Msg, Nonce, K) ->
+  enacl:box_afternm(Msg, Nonce, K).
+
+box_open_afternm(Box, Nonce, K) ->
+  enacl:box_open_afternm(Box, Nonce, K).
+
 generate_short_term_keypair(Codec) ->
   #{public := CSTPK, secret := CSTSK} = keypair(),
   Codec#codec{client_short_term_public_key=CSTPK,
-                     client_short_term_secret_key=CSTSK}.
+              client_short_term_secret_key=CSTSK}.
+
+generate_shared_key(Codec) ->
+  #codec{server_short_term_public_key=SSTPK,
+         client_short_term_secret_key=CSTSK} = Codec,
+  SharedKey = box_beforenm(SSTPK, CSTSK),
+  Codec#codec{shared_key=SharedKey}.
 
 init([CLTPK, CLTSK, Owner, Ip, Port, ServerExt, SLTPK]) ->
   ClientExtension = ecurvecp:extension(),
@@ -81,20 +97,24 @@ connect(timeout, State) ->
   {next_state, cookie, State, Timeout}.
 
 cookie(<<?COOKIE, _/binary>> = Packet, State) ->
-  #st{socket=Socket, ip=Ip, port=Port} = State,
+  #st{socket=Socket, ip=Ip, port=Port, handshake_ttl=Timeout} = State,
   Codec = decode_cookie_packet(Packet, State#st.codec),
   InitiatePacket = encode_initiate_packet(Codec),
   ok = gen_udp:send(Socket, Ip, Port, InitiatePacket),
-  {next_state, ready, State#st{codec=Codec}};
+  {next_state, ready, State#st{codec=Codec}, Timeout};
 cookie(timeout, State) ->
   {stop, handshake_timeout, State}.
 
 ready(<<?SERVER_M, _/binary>> = Packet, State) ->
-  #st{ttl=Timeout} = State,
   {ok, _Message, Codec} = decode_server_message_packet(Packet, State#st.codec),
-  {next_state, message, State#st{codec=Codec}, Timeout};
+  {next_state, finalize, State#st{codec=Codec}, 0};
 ready(timeout, State) ->
   {stop, handshake_timeout, State}.
+
+finalize(timeout, State) ->
+  #st{ttl=Timeout} = State,
+  Codec = generate_shared_key(State#st.codec),
+  {next_state, message, State#st{codec=Codec}, Timeout}.
 
 message(<<?SERVER_M, _/binary>> = Packet, State) ->
   #st{ttl=Timeout} = State,
@@ -194,12 +214,17 @@ encode_vouch(Codec) ->
 encode_client_message_packet(Message, Codec) ->
   #codec{server_extension=SE,
          client_extension=CE,
-         client_short_term_public_key=CSTPK,
+         server_short_term_public_key=SSTPK,
          client_short_term_secret_key=CSTSK,
-         server_short_term_public_key=SSTPK} = Codec,
-  Nonce = ecurvecp_nonces:short_term_nonce(CSTSK),
+         client_short_term_public_key=CSTPK,
+         shared_key=SharedKey} = Codec,
+  Nonce = ecurvecp_nonces:short_term_nonce(SharedKey),
   NonceString = ecurvecp_nonces:nonce_string(client_message, Nonce),
-  Box = box(Message, NonceString, SSTPK, CSTSK),
+  Box = if SharedKey =:= undefined ->
+      box(Message, NonceString, SSTPK, CSTSK);
+    true ->
+      box_afternm(Message, NonceString, SharedKey)
+  end,
   <<?CLIENT_M, SE/binary, CE/binary, CSTPK/binary, Nonce/binary, Box/binary>>.
 
 encode_client_message(PlainText, Codec) ->
@@ -213,9 +238,14 @@ decode_server_message_packet(<<?SERVER_M, Exts:32/binary, Rest/binary>>, Codec) 
 
 decode_server_message_body(<<Nonce:8/binary, Box/binary>>, Codec) ->
   #codec{server_short_term_public_key=SSTPK,
-         client_short_term_secret_key=CSTSK} = Codec,
+         client_short_term_secret_key=CSTSK,
+         shared_key=SharedKey} = Codec,
   NonceString = ecurvecp_nonces:nonce_string(server_message, Nonce),
-  {ok, Contents} =  box_open(Box, NonceString, SSTPK, CSTSK),
+  {ok, Contents} = if SharedKey =:= undefined ->
+      box_open(Box, NonceString, SSTPK, CSTSK);
+    true ->
+      box_open_afternm(Box, NonceString, SharedKey)
+  end,
   {ok, Contents, Codec}.
 
 decode_server_message(<<Id:4/binary, PlainText/binary>>) ->
