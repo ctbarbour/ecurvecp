@@ -4,7 +4,7 @@
 -export([start_link/2, start_link/3, start_link/4, handle_curvecp_packet/2]).
 -export([init/1, handle_event/3, handle_sync_event/4, handle_info/3,
          code_change/4, terminate/3]).
--export([hello/2, initiate/2, message/2]).
+-export([hello/2, initiate/2, finalize/2, message/2]).
 
 -include("ecurvecp.hrl").
 
@@ -17,6 +17,7 @@
     client_short_term_public_key,
     minute_key,
     prev_minute_key,
+    shared_key,
     cookie,
     server_extension,
     client_extension
@@ -74,6 +75,21 @@ secretbox(Box, Nonce, PK) ->
 secretbox_open(Box, Nonce, K) ->
   enacl:secretbox_open(Box, Nonce, K).
 
+box_beforenm(PK, SK) ->
+  enacl:box_beforenm(PK, SK).
+
+box_afternm(Msg, Nonce, K) ->
+  enacl:box_afternm(Msg, Nonce, K).
+
+box_open_afternm(Box, Nonce, K) ->
+  enacl:box_open_afternm(Box, Nonce, K).
+
+generate_shared_key(Codec) ->
+  #codec{client_short_term_public_key=CSTPK,
+         server_short_term_secret_key=SSTSK} = Codec,
+  SharedKey = box_beforenm(CSTPK, SSTSK),
+  Codec#codec{shared_key=SharedKey}.
+
 keypair() ->
   enacl:box_keypair().
 
@@ -126,13 +142,18 @@ initiate(timeout, State) ->
   {stop, handshake_timeout, State}.
 
 message({client_message, From, Packet}, State) ->
-  #st{ttl=Timeout, codec=Codec0} = State,
+  #st{codec=Codec0} = State,
   {ok, ClientMessage, Codec} = decode_client_message_packet(Packet, Codec0),
   ServerMessagePacket = encode_server_message_packet(ClientMessage, Codec),
   ok = ecurvecp_udp:reply(From, ServerMessagePacket),
-  {next_state, message, State#st{codec=Codec}, Timeout};
+  {next_state, finalize, State#st{codec=Codec}, 0};
 message(timeout, State) ->
   {stop, timeout, State}.
+
+finalize(timeout, State) ->
+  #st{ttl=Timeout} = State,
+  Codec = generate_shared_key(State#st.codec),
+  {next_state, message, State#st{codec=Codec}, Timeout}.
 
 handle_event(_Event, StateName, StateData) ->
   {next_state, StateName, StateData}.
@@ -240,21 +261,33 @@ verify_domain_name(_DomainName, _Codec) ->
 encode_server_message_packet(Message, Codec) ->
   #codec{server_short_term_secret_key=SSTSK,
          client_short_term_public_key=CSTPK,
+         shared_key=SharedKey,
          client_extension=CE,
          server_extension=SE} = Codec,
 
   Nonce = ecurvecp_nonces:short_term_nonce(SSTSK),
   NonceString = ecurvecp_nonces:nonce_string(server_message, Nonce),
-  Box = box(Message, NonceString, CSTPK, SSTSK),
+  Box = if
+    SharedKey =:= undefined ->
+      box(Message, NonceString, CSTPK, SSTSK);
+    true ->
+      box_afternm(Message, NonceString, SharedKey)
+  end,
   <<?SERVER_M, CE/binary, SE/binary, Nonce/binary, Box/binary>>.
 
 decode_client_message_packet(<<?CLIENT_M, _SE:16/binary, _CE:16/binary,
                                CSTPK:32/binary, Nonce:8/binary, Box/binary>>,
                              Codec) ->
   #codec{client_short_term_public_key=CSTPK,
-         server_short_term_secret_key=SSTSK} = Codec,
+         server_short_term_secret_key=SSTSK,
+         shared_key=SharedKey} = Codec,
   NonceString = ecurvecp_nonces:nonce_string(client_message, Nonce),
-  {ok, Message} = box_open(Box, NonceString, CSTPK, SSTSK),
+  {ok, Message} = if
+    SharedKey =:= undefined ->
+      box_open(Box, NonceString, CSTPK, SSTSK);
+    true ->
+      box_open_afternm(Box, NonceString, SharedKey)
+  end,
   {ok, Message, Codec}.
 
 rotate_minute_keys(#codec{minute_key=undefined} = Codec) ->
