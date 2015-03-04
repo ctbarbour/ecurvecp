@@ -1,10 +1,11 @@
--module(ecurvecp_server).
+-module(ecurvecp_protocol).
 -behavior(gen_fsm).
+-behavior(ranch_protocol).
 
--export([start_link/2, start_link/3, start_link/4, handle_curvecp_packet/2]).
+-export([start_link/4, init/4, reply/2]).
 -export([init/1, handle_event/3, handle_sync_event/4, handle_info/3,
          code_change/4, terminate/3]).
--export([hello/2, initiate/2, finalize/2, message/2]).
+-export([hello/2, initiate/2, finalize/2, message/2, message/3]).
 
 -include("ecurvecp.hrl").
 
@@ -24,160 +25,107 @@
   }).
 
 -record(st, {
-    handshake_ttl                   = 60000,
-    ttl                             = 360000,
-    codec
+    socket                    :: inet:socket(),
+    transport                 :: ranch:transport(),
+    codec                     :: codec(),
+    handshake_ttl   = 60000   :: pos_integer(),
+    ttl             = 360000  :: pos_integer()
   }).
 
--record(hello_packet, {
-    server_extension,
-    client_extension,
-    client_short_term_public_key,
-    nonce,
-    box
-  }).
+-type codec() :: #codec{}.
 
--record(initiate_packet, {
-    server_extension,
-    client_extension,
-    client_short_term_public_key,
-    cookie,
-    nonce,
-    box
-  }).
+socket_options() ->
+  [{active, once},
+   {packet, 4},
+   {reuseaddr, true},
+   binary].
 
--record(client_msg_packet, {
-    server_extension,
-    client_extension,
-    client_short_term_public_key,
-    nonce,
-    box
-  }).
+reply(Pid, Message) ->
+  gen_fsm:send_event(Pid, {reply, Message}).
 
-handle_curvecp_packet(From, <<?HELLO, SE:16/binary, CE:16/binary,
-                              CSTPK:32/binary, _Z:64/binary, Nonce:8/binary,
-                              Box:80/binary>>) ->
+start_link(Ref, Socket, Transport, Opts) ->
+  proc_lib:start_link(?MODULE, init, [Ref, Socket, Transport, Opts]).
 
-  Hello = #hello_packet{server_extension=SE,
-                        client_extension=CE,
-                        client_short_term_public_key=CSTPK,
-                        nonce=Nonce,
-                        box=Box},
+init(Ref, Socket, Transport, Opts) ->
+  ok = proc_lib:init_ack({ok, self()}),
+  ok = ranch:accept_ack(Ref),
+  case Transport:setopts(Socket, socket_options()) of
+    ok ->
+      #{ public := SLTPK, secret := SLTSK} = proplists:get_value(server_keypair, Opts, enacl:box_keypair()),
+      ServerExtension = proplists:get_value(server_extension, Opts, druuid:v4()),
 
-  {ok, Pid} = ecurvecp_server_sup:start_server(),
-  gen_fsm:send_event(Pid, {Hello, From});
-handle_curvecp_packet(From, <<?INITIATE, SE:16/binary, CE:16/binary,
-                              CSTPK:32/binary,
-                              Cookie:96/binary, Nonce:8/binary,
-                              Box/binary>>) ->
+      Codec = rotate_minute_keys(
+          #codec{server_long_term_public_key=SLTPK,
+                 server_long_term_secret_key=SLTSK,
+                 server_extension=ServerExtension}),
 
-  Initiate = #initiate_packet{server_extension=SE, client_extension=CE,
-                              client_short_term_public_key=CSTPK,
-                              cookie=Cookie, nonce=Nonce, box=Box},
-
-  dispatch(CSTPK, {Initiate, From});
-handle_curvecp_packet(From, <<?CLIENT_M, SE:16/binary, CE:16/binary,
-                              CSTPK:32/binary, Nonce:8/binary, Box/binary>>) ->
-
-  ClientMPacket = #client_msg_packet{server_extension=SE,
-                                     client_extension=CE,
-                                     client_short_term_public_key=CSTPK,
-                                     nonce=Nonce,
-                                     box=Box},
-
-  dispatch(CSTPK, {ClientMPacket, From});
-handle_curvecp_packet(_From, _Packet) ->
-  ok.
-
-dispatch(Key, Msg) ->
-  case lookup(Key) of
-    {ok, ClientPid} ->
-      gen_fsm:send_event(ClientPid, Msg);
-    not_found ->
-      ok
+      State = #st{socket=Socket, transport=Transport, codec=Codec},
+      gen_fsm:enter_loop(?MODULE, [], hello, State);
+    {error, closed} ->
+      {stop, socket_closed}
   end.
 
-lookup(ClientExt) ->
-  case catch(gproc:lookup_local_name({ecurvecp_server, ClientExt})) of
-    {'EXIT', {badarg, _}} ->
-      not_found;
-    Pid ->
-      {ok, Pid}
-  end.
+decode_curvecp_packet(<<?HELLO, SE:16/binary, CE:16/binary, CSTPK:32/binary,
+                        _Z:64/binary, Nonce:8/binary, Box:80/binary>>) ->
+  #hello_packet{server_extension=SE,
+                client_extension=CE,
+                client_short_term_public_key=CSTPK,
+                nonce=Nonce,
+                box=Box};
+decode_curvecp_packet(<<?INITIATE, SE:16/binary, CE:16/binary, CSTPK:32/binary,
+                        Cookie:96/binary, Nonce:8/binary, Box/binary>>) ->
+  #initiate_packet{server_extension=SE, client_extension=CE,
+                   client_short_term_public_key=CSTPK,
+                   cookie=Cookie, nonce=Nonce, box=Box};
+decode_curvecp_packet(<<?CLIENT_M, SE:16/binary, CE:16/binary, CSTPK:32/binary,
+                        Nonce:8/binary, Box/binary>>) ->
+  #client_msg_packet{server_extension=SE,
+                     client_extension=CE,
+                     client_short_term_public_key=CSTPK,
+                     nonce=Nonce,
+                     box=Box}.
 
-start_link(KeyPair, Extension) ->
-  start_link(KeyPair, Extension, []).
+init([]) ->
+  {ok, #st{}}.
 
-start_link(#{public := PK, secret := SK}, Extension, Opts) ->
-  start_link(PK, SK, Extension, Opts).
-
-start_link(PK, SK, Extension, Opts) ->
-  Args = [PK, SK, Extension, proplists:unfold(Opts)],
-  gen_fsm:start_link(?MODULE, Args, []).
-
-generate_shared_key(Codec) ->
-  #codec{client_short_term_public_key=CSTPK,
-         server_short_term_secret_key=SSTSK} = Codec,
-  SharedKey = enacl:box_beforenm(CSTPK, SSTSK),
-  Codec#codec{shared_key=SharedKey}.
-
-generate_minute_key() ->
-  enacl:randombytes(32).
-
-generate_short_term_keys(Codec) ->
-  #{public := SSTPK, secret := SSTSK} = enacl:box_keypair(),
-  Codec#codec{server_short_term_public_key=SSTPK,
-              server_short_term_secret_key=SSTSK}.
-
-parse_opts([], State) ->
-  State;
-parse_opts([{handshake_ttl, HTTL}|Rest], State) ->
-  parse_opts(Rest, State#st{handshake_ttl=HTTL});
-parse_opts([{ttl, TTL}|Rest], State) ->
-  parse_opts(Rest, State#st{ttl=TTL});
-parse_opts([_|Rest], State) ->
-  parse_opts(Rest, State).
-
-init([PK, SK, Extension, Opts]) ->
-  Codec = rotate_minute_keys(
-      #codec{server_long_term_public_key=PK,
-             server_long_term_secret_key=SK,
-             server_extension=Extension}),
-
-  State = parse_opts(Opts, #st{codec=Codec}),
-  {ok, hello, State}.
-
-hello({#hello_packet{} = Hello, From}, State) ->
-  #st{handshake_ttl=Timeout, codec=Codec0} = State,
+hello(#hello_packet{} = Hello, State) ->
+  #st{handshake_ttl=Timeout, codec=Codec0,
+      transport=Transport, socket=Socket} = State,
   Codec = generate_short_term_keys(decode_hello_packet(Hello, Codec0)),
   CookiePacket = encode_cookie_packet(Codec),
-  true = gproc:add_local_name({?MODULE, Codec#codec.client_short_term_public_key}),
-  ok = ecurvecp_udp:reply(From, CookiePacket),
+  ok = Transport:send(Socket, CookiePacket),
   {next_state, initiate, State#st{codec=Codec}, Timeout};
 hello(timeout, State) ->
   {stop, timeout, State}.
 
-initiate({#initiate_packet{} = Initiate, From}, State) ->
-  #st{handshake_ttl=Timeout, codec=Codec0} = State,
+initiate(#initiate_packet{} = Initiate, State) ->
+  #st{codec=Codec0, transport=Transport, socket=Socket} = State,
   Codec = decode_initiate_packet(Initiate, Codec0),
   MessagePacket = encode_server_message_packet(<<"Welcome">>, Codec),
-  ok = ecurvecp_udp:reply(From, MessagePacket),
-  {next_state, message, State#st{codec=Codec}, Timeout};
+  ok = Transport:send(Socket, MessagePacket),
+  {next_state, finalize, State#st{codec=Codec}, 0};
 initiate(timeout, State) ->
   {stop, handshake_timeout, State}.
-
-message({#client_msg_packet{} = Packet, From}, State) ->
-  {ok, ClientM, Codec} = decode_client_message_packet(Packet, State#st.codec),
-  ServerMessagePacket = encode_server_message_packet(ClientM, Codec),
-  ok = ecurvecp_udp:reply(From, ServerMessagePacket),
-  {next_state, finalize, State#st{codec=Codec}, 0};
-message(timeout, State) ->
-  {stop, timeout, State}.
 
 finalize(timeout, State) ->
   #st{ttl=Timeout} = State,
   Codec = generate_shared_key(State#st.codec),
   {next_state, message, State#st{codec=Codec}, Timeout}.
+
+message(#client_msg_packet{} = Packet, State) ->
+  #st{transport=Transport, socket=Socket, ttl=Timeout} = State,
+  {ok, ClientM, Codec} = decode_client_message_packet(Packet, State#st.codec),
+  ServerMessagePacket = encode_server_message_packet(ClientM, Codec),
+  ok = Transport:send(Socket, ServerMessagePacket),
+  {next_state, message, State#st{codec=Codec}, Timeout};
+message(timeout, State) ->
+  {stop, timeout, State}.
+
+message({reply, Message}, _From, State) ->
+  #st{transport=Transport, socket=Socket, ttl=Timeout} = State,
+  ServerMessagePacket = encode_server_message_packet(Message, State#st.codec),
+  ok = Transport:send(Socket, ServerMessagePacket),
+  {next_state, message, State, Timeout}.
 
 handle_event(_Event, StateName, StateData) ->
   {next_state, StateName, StateData}.
@@ -188,8 +136,19 @@ handle_sync_event(_Event, _From, StateName, StateData) ->
 handle_info(rotate, StateName, StateData) ->
   Codec = rotate_minute_keys(StateData#st.codec),
   {next_state, StateName, StateData#st{codec=Codec}};
-handle_info(_Info, StateName, StateData) ->
-  {next_state, StateName, StateData}.
+handle_info(Info, StateName, StateData) ->
+  #st{socket=Socket, transport=Transport} = StateData,
+  {Ok, Closed, Error} = Transport:messages(),
+  case Info of
+    {Ok, Socket, Packet} ->
+      StateName(decode_curvecp_packet(Packet), StateData);
+    {Error, Socket} ->
+      {stop, Error, StateData};
+    {Closed, Socket} ->
+      {stop, normal, StateData};
+    _ ->
+      {next_state, StateName, StateData}
+  end.
 
 code_change(_OldVsn, StateName, StateData, _Extra) ->
   {ok, StateName, StateData}.
@@ -214,7 +173,7 @@ decode_hello_packet_box(Nonce, Box, CSTPK, Codec) ->
   verify_hello_box_contents(Contents).
 
 verify_hello_box_contents(<<First:32/binary, Second:32/binary>>) ->
-  Zeros = <<0:256>>,
+  Zeros = binary:copy(<<0>>, 32),
   enacl:verify_32(First, Zeros) andalso enacl:verify_32(Second, Zeros);
 verify_hello_box_contents(_Contents) ->
   false.
@@ -319,6 +278,21 @@ decode_client_message_packet(ClientMsgPacket, Codec) ->
       enacl:box_open_afternm(Box, NonceString, SharedKey)
   end,
   {ok, Message, Codec}.
+
+generate_shared_key(Codec) ->
+  #codec{client_short_term_public_key=CSTPK,
+         server_short_term_secret_key=SSTSK} = Codec,
+  SharedKey = enacl:box_beforenm(CSTPK, SSTSK),
+  Codec#codec{shared_key=SharedKey}.
+
+generate_minute_key() ->
+  enacl:randombytes(32).
+
+generate_short_term_keys(Codec) ->
+  #{public := SSTPK, secret := SSTSK} = enacl:box_keypair(),
+  Codec#codec{server_short_term_public_key=SSTPK,
+              server_short_term_secret_key=SSTSK}.
+
 
 rotate_minute_keys(#codec{minute_key=undefined} = Codec) ->
   MinuteKey = generate_minute_key(),

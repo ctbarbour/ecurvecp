@@ -7,7 +7,6 @@
   {mod, {ecurvecp_app, []}},
   {applications, [
     kernel,
-    stdlib,
-    gproc
+    stdlib
   ]}
 ]}.
