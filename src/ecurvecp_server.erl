@@ -29,16 +29,68 @@
     codec
   }).
 
-handle_curvecp_packet(From, <<?HELLO, _/binary>> = Packet) ->
-  {ok, Pid} = ecurvecp_server_sup:start_server(),
-  gen_fsm:send_event(Pid, {hello, From, Packet});
-handle_curvecp_packet(From, <<?INITIATE, Exts:32/binary, _/binary>> = Packet) ->
-  dispatch(Exts, {initiate, From, Packet});
-handle_curvecp_packet(From, <<?CLIENT_M, Exts:32/binary, _/binary>> = Packet) ->
-  dispatch(Exts, {client_message, From, Packet}).
+-record(hello_packet, {
+    server_extension,
+    client_extension,
+    client_short_term_public_key,
+    nonce,
+    box
+  }).
 
-dispatch(<<_SE:16/binary, CE:16/binary>>, Msg) ->
-  case lookup(CE) of
+-record(initiate_packet, {
+    server_extension,
+    client_extension,
+    client_short_term_public_key,
+    cookie,
+    nonce,
+    box
+  }).
+
+-record(client_msg_packet, {
+    server_extension,
+    client_extension,
+    client_short_term_public_key,
+    nonce,
+    box
+  }).
+
+handle_curvecp_packet(From, <<?HELLO, SE:16/binary, CE:16/binary,
+                              CSTPK:32/binary, _Z:64/binary, Nonce:8/binary,
+                              Box:80/binary>>) ->
+
+  Hello = #hello_packet{server_extension=SE,
+                        client_extension=CE,
+                        client_short_term_public_key=CSTPK,
+                        nonce=Nonce,
+                        box=Box},
+
+  {ok, Pid} = ecurvecp_server_sup:start_server(),
+  gen_fsm:send_event(Pid, {Hello, From});
+handle_curvecp_packet(From, <<?INITIATE, SE:16/binary, CE:16/binary,
+                              CSTPK:32/binary,
+                              Cookie:96/binary, Nonce:8/binary,
+                              Box/binary>>) ->
+
+  Initiate = #initiate_packet{server_extension=SE, client_extension=CE,
+                              client_short_term_public_key=CSTPK,
+                              cookie=Cookie, nonce=Nonce, box=Box},
+
+  dispatch(CSTPK, {Initiate, From});
+handle_curvecp_packet(From, <<?CLIENT_M, SE:16/binary, CE:16/binary,
+                              CSTPK:32/binary, Nonce:8/binary, Box/binary>>) ->
+
+  ClientMPacket = #client_msg_packet{server_extension=SE,
+                                     client_extension=CE,
+                                     client_short_term_public_key=CSTPK,
+                                     nonce=Nonce,
+                                     box=Box},
+
+  dispatch(CSTPK, {ClientMPacket, From});
+handle_curvecp_packet(_From, _Packet) ->
+  ok.
+
+dispatch(Key, Msg) ->
+  case lookup(Key) of
     {ok, ClientPid} ->
       gen_fsm:send_event(ClientPid, Msg);
     not_found ->
@@ -95,26 +147,26 @@ init([PK, SK, Extension, Opts]) ->
   State = parse_opts(Opts, #st{codec=Codec}),
   {ok, hello, State}.
 
-hello({hello, From, Packet}, State) ->
+hello({#hello_packet{} = Hello, From}, State) ->
   #st{handshake_ttl=Timeout, codec=Codec0} = State,
-  Codec = generate_short_term_keys(decode_hello_packet(Packet, Codec0)),
+  Codec = generate_short_term_keys(decode_hello_packet(Hello, Codec0)),
   CookiePacket = encode_cookie_packet(Codec),
-  true = gproc:add_local_name({?MODULE, Codec#codec.client_extension}),
+  true = gproc:add_local_name({?MODULE, Codec#codec.client_short_term_public_key}),
   ok = ecurvecp_udp:reply(From, CookiePacket),
   {next_state, initiate, State#st{codec=Codec}, Timeout};
 hello(timeout, State) ->
   {stop, timeout, State}.
 
-initiate({initiate, From, Packet}, State) ->
+initiate({#initiate_packet{} = Initiate, From}, State) ->
   #st{handshake_ttl=Timeout, codec=Codec0} = State,
-  Codec = decode_initiate_packet(Packet, Codec0),
+  Codec = decode_initiate_packet(Initiate, Codec0),
   MessagePacket = encode_server_message_packet(<<"Welcome">>, Codec),
   ok = ecurvecp_udp:reply(From, MessagePacket),
   {next_state, message, State#st{codec=Codec}, Timeout};
 initiate(timeout, State) ->
   {stop, handshake_timeout, State}.
 
-message({client_message, From, Packet}, State) ->
+message({#client_msg_packet{} = Packet, From}, State) ->
   {ok, ClientM, Codec} = decode_client_message_packet(Packet, State#st.codec),
   ServerMessagePacket = encode_server_message_packet(ClientM, Codec),
   ok = ecurvecp_udp:reply(From, ServerMessagePacket),
@@ -145,9 +197,12 @@ code_change(_OldVsn, StateName, StateData, _Extra) ->
 terminate(_Reason, _StateName, _StateData) ->
   ok.
 
-decode_hello_packet(<<?HELLO, SE:16/binary, CE:16/binary, CSTPK:32/binary,
-                      _Zeros:64/binary, Nonce:8/binary, Box:80/binary>>,
-                    Codec) ->
+decode_hello_packet(Hello, Codec) ->
+  #hello_packet{nonce=Nonce,
+                box=Box,
+                client_short_term_public_key=CSTPK,
+                server_extension=SE,
+                client_extension=CE} = Hello,
   true = decode_hello_packet_box(Nonce, Box, CSTPK, Codec),
   Codec#codec{server_extension=SE, client_extension=CE,
               client_short_term_public_key=CSTPK}.
@@ -186,14 +241,17 @@ encode_cookie(ClientShortTermPubKey, ServerShortTermSecKey, MinuteKey) ->
   Box = enacl:secretbox(Msg, NonceString, MinuteKey),
   <<Nonce/binary, Box/binary>>.
 
-decode_initiate_packet(<<?INITIATE, _SE:16/binary, _CE:16/binary,
-                         CSTPK:32/binary, Cookie:96/binary, Nonce:8/binary,
-                         Box/binary>>, Codec) ->
+decode_initiate_packet(Initiate, Codec) ->
+  #initiate_packet{cookie=Cookie,
+                   client_short_term_public_key=CSTPK,
+                   nonce=Nonce,
+                   box=Box} = Initiate,
   true = verify_cookie(Cookie, CSTPK, Codec),
   decode_initiate_box(Nonce, Box, Codec).
 
 verify_cookie(<<Nonce:16/binary, Box:80/binary>>, CSTPK, Codec) ->
-  #codec{minute_key=MK} = Codec,
+  % TODO: check both minute key and prev minute key
+  #codec{minute_key=MK, prev_minute_key=_PMK} = Codec,
   NonceString = ecurvecp_nonces:nonce_string(minute_key, Nonce),
   case enacl:secretbox_open(Box, NonceString, MK) of
     {ok, <<BoxedCSTPK:32/binary, _:32/binary>>} ->
@@ -247,12 +305,12 @@ encode_server_message_packet(Message, Codec) ->
   end,
   <<?SERVER_M, CE/binary, SE/binary, Nonce/binary, Box/binary>>.
 
-decode_client_message_packet(<<?CLIENT_M, _SE:16/binary, _CE:16/binary,
-                               CSTPK:32/binary, Nonce:8/binary, Box/binary>>,
-                             Codec) ->
+decode_client_message_packet(ClientMsgPacket, Codec) ->
+  #client_msg_packet{nonce=Nonce, box=Box} = ClientMsgPacket,
   #codec{client_short_term_public_key=CSTPK,
          server_short_term_secret_key=SSTSK,
          shared_key=SharedKey} = Codec,
+
   NonceString = ecurvecp_nonces:nonce_string(client_message, Nonce),
   {ok, Message} = if
     SharedKey =:= undefined ->

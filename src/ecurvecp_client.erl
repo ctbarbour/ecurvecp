@@ -29,8 +29,8 @@
     port,
     socket,
     codec,
-    handshake_ttl = 360000,
-    ttl = 60000,
+    handshake_ttl = 60000,
+    ttl = 360000,
     from,
     owner
   }).
@@ -107,11 +107,11 @@ message(timeout, State) ->
   {stop, timeout, State}.
 
 message({message, PlainText}, From, State) ->
-  #st{socket=Socket, ip=Ip, port=Port} = State,
+  #st{socket=Socket, ip=Ip, port=Port, ttl=Timeout} = State,
   {ok, Message, Codec} = encode_client_message(PlainText, State#st.codec),
   Packet = encode_client_message_packet(Message, Codec),
   ok = gen_udp:send(Socket, Ip, Port, Packet),
-  {next_state, message, State#st{codec=Codec, from=From}}.
+  {next_state, message, State#st{codec=Codec, from=From}, Timeout}.
 
 reply(ServerMessage, State) ->
   #st{from=From} = State,
@@ -139,12 +139,12 @@ handle_info(_Info, StateName, State) ->
 
 encode_hello_packet(Codec) ->
   #codec{server_long_term_public_key=SLTPK,
-                client_short_term_public_key=CSTPK,
-                client_short_term_secret_key=CSTSK,
-                server_extension=SE,
-                client_extension=CE} = Codec,
+         client_short_term_public_key=CSTPK,
+         client_short_term_secret_key=CSTSK,
+         server_extension=SE,
+         client_extension=CE} = Codec,
 
-  Zeros = <<0:512>>,
+  Zeros = binary:copy(<<0>>, 64),
   Nonce = ecurvecp_nonces:short_term_nonce(CSTSK),
   NonceString = ecurvecp_nonces:nonce_string(hello, Nonce),
   Box = enacl:box(Zeros, NonceString, SLTPK, CSTSK),

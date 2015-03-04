@@ -33,7 +33,7 @@ init([Ip, Port, Extension]) ->
       [];
     _ ->
       [{ip, Ip}]
-  end ++ [binary, {active, once}, inet, inet6],
+  end ++ [binary, {active, true}, inet, inet6],
   {ok, Socket} = gen_udp:open(Port, SocketOpts),
   State = #st{listen_ip=Ip, listen_port=Port, socket=Socket,
               server_extension=Extension},
@@ -65,5 +65,5 @@ terminate(_Reason, _State) ->
 active_once(#st{socket=undefined} = State) ->
   State;
 active_once(#st{socket=Socket} = State) ->
-  ok = inet:setopts(Socket, [{active, once}]),
+  ok = inet:setopts(Socket, [{active, true}]),
   State.
