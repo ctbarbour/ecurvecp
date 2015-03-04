@@ -49,21 +49,17 @@ start_link(Ref, Socket, Transport, Opts) ->
 init(Ref, Socket, Transport, Opts) ->
   ok = proc_lib:init_ack({ok, self()}),
   ok = ranch:accept_ack(Ref),
-  case Transport:setopts(Socket, socket_options()) of
-    ok ->
-      #{ public := SLTPK, secret := SLTSK} = proplists:get_value(server_keypair, Opts, enacl:box_keypair()),
-      ServerExtension = proplists:get_value(server_extension, Opts, druuid:v4()),
+  ok = Transport:setopts(Socket, socket_options()),
+  #{public := SLTPK, secret := SLTSK} = proplists:get_value(server_keypair, Opts),
+  ServerExtension = proplists:get_value(server_extension, Opts),
 
-      Codec = rotate_minute_keys(
-          #codec{server_long_term_public_key=SLTPK,
-                 server_long_term_secret_key=SLTSK,
-                 server_extension=ServerExtension}),
+  Codec = rotate_minute_keys(
+      #codec{server_long_term_public_key=SLTPK,
+             server_long_term_secret_key=SLTSK,
+             server_extension=ServerExtension}),
 
-      State = #st{socket=Socket, transport=Transport, codec=Codec},
-      gen_fsm:enter_loop(?MODULE, [], hello, State);
-    {error, closed} ->
-      {stop, socket_closed}
-  end.
+  State = #st{socket=Socket, transport=Transport, codec=Codec},
+  gen_fsm:enter_loop(?MODULE, [], hello, State).
 
 decode_curvecp_packet(<<?HELLO, SE:16/binary, CE:16/binary, CSTPK:32/binary,
                         _Z:64/binary, Nonce:8/binary, Box:80/binary>>) ->
@@ -89,20 +85,19 @@ init([]) ->
   {ok, #st{}}.
 
 hello(#hello_packet{} = Hello, State) ->
-  #st{handshake_ttl=Timeout, codec=Codec0,
-      transport=Transport, socket=Socket} = State,
-  Codec = generate_short_term_keys(decode_hello_packet(Hello, Codec0)),
+  #st{handshake_ttl=Timeout} = State,
+  Codec = generate_short_term_keys(
+      decode_hello_packet(Hello, State#st.codec)),
   CookiePacket = encode_cookie_packet(Codec),
-  ok = Transport:send(Socket, CookiePacket),
+  ok = send(CookiePacket, State),
   {next_state, initiate, State#st{codec=Codec}, Timeout};
 hello(timeout, State) ->
   {stop, timeout, State}.
 
 initiate(#initiate_packet{} = Initiate, State) ->
-  #st{codec=Codec0, transport=Transport, socket=Socket} = State,
-  Codec = decode_initiate_packet(Initiate, Codec0),
+  Codec = decode_initiate_packet(Initiate, State#st.codec),
   MessagePacket = encode_server_message_packet(<<"Welcome">>, Codec),
-  ok = Transport:send(Socket, MessagePacket),
+  ok = send(MessagePacket, State),
   {next_state, finalize, State#st{codec=Codec}, 0};
 initiate(timeout, State) ->
   {stop, handshake_timeout, State}.
@@ -113,18 +108,18 @@ finalize(timeout, State) ->
   {next_state, message, State#st{codec=Codec}, Timeout}.
 
 message(#client_msg_packet{} = Packet, State) ->
-  #st{transport=Transport, socket=Socket, ttl=Timeout} = State,
+  #st{ttl=Timeout} = State,
   {ok, ClientM, Codec} = decode_client_message_packet(Packet, State#st.codec),
   ServerMessagePacket = encode_server_message_packet(ClientM, Codec),
-  ok = Transport:send(Socket, ServerMessagePacket),
+  ok = send(ServerMessagePacket, State),
   {next_state, message, State#st{codec=Codec}, Timeout};
 message(timeout, State) ->
   {stop, timeout, State}.
 
 message({reply, Message}, _From, State) ->
-  #st{transport=Transport, socket=Socket, ttl=Timeout} = State,
+  #st{ttl=Timeout} = State,
   ServerMessagePacket = encode_server_message_packet(Message, State#st.codec),
-  ok = Transport:send(Socket, ServerMessagePacket),
+  ok = send(ServerMessagePacket, State),
   {next_state, message, State, Timeout}.
 
 handle_event(_Event, StateName, StateData) ->
@@ -141,7 +136,7 @@ handle_info(Info, StateName, StateData) ->
   {Ok, Closed, Error} = Transport:messages(),
   case Info of
     {Ok, Socket, Packet} ->
-      StateName(decode_curvecp_packet(Packet), StateData);
+      ?MODULE:StateName(decode_curvecp_packet(Packet), active_once(StateData));
     {Error, Socket} ->
       {stop, Error, StateData};
     {Closed, Socket} ->
@@ -153,8 +148,14 @@ handle_info(Info, StateName, StateData) ->
 code_change(_OldVsn, StateName, StateData, _Extra) ->
   {ok, StateName, StateData}.
 
-terminate(_Reason, _StateName, _StateData) ->
+terminate(_Reason, _StateName, StateData) ->
+  #st{transport=Transport, socket=Socket} = StateData,
+  ok = Transport:close(Socket),
   ok.
+
+send(Packet, State) ->
+  #st{transport=Transport, socket=Socket} = State,
+  Transport:send(Socket, Packet).
 
 decode_hello_packet(Hello, Codec) ->
   #hello_packet{nonce=Nonce,
@@ -293,7 +294,6 @@ generate_short_term_keys(Codec) ->
   Codec#codec{server_short_term_public_key=SSTPK,
               server_short_term_secret_key=SSTSK}.
 
-
 rotate_minute_keys(#codec{minute_key=undefined} = Codec) ->
   MinuteKey = generate_minute_key(),
   rotate_minute_keys(Codec#codec{minute_key=MinuteKey});
@@ -302,3 +302,8 @@ rotate_minute_keys(Codec) ->
   MinuteKey = generate_minute_key(),
   _Ref = erlang:send_after(60000, self(), rotate),
   Codec#codec{minute_key=MinuteKey, prev_minute_key=PrevMinuteKey}.
+
+active_once(State) ->
+  #st{transport=Transport, socket=Socket} = State,
+  ok = Transport:setopts(Socket, [{active, once}]),
+  State.
