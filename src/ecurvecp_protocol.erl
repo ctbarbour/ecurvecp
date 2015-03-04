@@ -2,7 +2,7 @@
 -behavior(gen_fsm).
 -behavior(ranch_protocol).
 
--export([start_link/4, init/4, reply/2]).
+-export([start_link/4, init/4, reply/2, default_options/0]).
 -export([init/1, handle_event/3, handle_sync_event/4, handle_info/3,
          code_change/4, terminate/3]).
 -export([hello/2, initiate/2, finalize/2, message/2, message/3]).
@@ -39,6 +39,10 @@ socket_options() ->
    {packet, 4},
    {reuseaddr, true},
    binary].
+
+default_options() ->
+  [{server_keypair, enacl:box_keypair()},
+   {server_extension, ecurvecp:extension()}].
 
 reply(Pid, Message) ->
   gen_fsm:send_event(Pid, {reply, Message}).
