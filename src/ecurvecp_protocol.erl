@@ -2,7 +2,7 @@
 -behavior(gen_fsm).
 -behavior(ranch_protocol).
 
--export([start_link/4, init/4, reply/2, default_options/0]).
+-export([start_link/3, start_link/4, init/4, reply/2, default_options/0]).
 -export([init/1, handle_event/3, handle_sync_event/4, handle_info/3,
          code_change/4, terminate/3]).
 -export([hello/2, initiate/2, finalize/2, message/2, message/3]).
@@ -47,13 +47,21 @@ default_options() ->
 reply(Pid, Message) ->
   gen_fsm:send_event(Pid, {reply, Message}).
 
+start_link(Socket, Transport, Opts) ->
+  gen_fsm:start_link(?MODULE, [Socket, Transport, Opts], []).
+
 start_link(Ref, Socket, Transport, Opts) ->
   proc_lib:start_link(?MODULE, init, [Ref, Socket, Transport, Opts]).
 
 init(Ref, Socket, Transport, Opts) ->
   ok = proc_lib:init_ack({ok, self()}),
   ok = ranch:accept_ack(Ref),
+  {ok, StateName, StateData} = init([Transport, Socket, Opts]),
+  gen_fsm:enter_loop(?MODULE, [], StateName, StateData).
+
+init([Socket, Transport, Opts]) ->
   ok = Transport:setopts(Socket, socket_options()),
+
   #{public := SLTPK, secret := SLTSK} = proplists:get_value(server_keypair, Opts),
   ServerExtension = proplists:get_value(server_extension, Opts),
 
@@ -63,30 +71,7 @@ init(Ref, Socket, Transport, Opts) ->
              server_extension=ServerExtension}),
 
   State = #st{socket=Socket, transport=Transport, codec=Codec},
-  gen_fsm:enter_loop(?MODULE, [], hello, State).
-
-decode_curvecp_packet(<<?HELLO, SE:16/binary, CE:16/binary, CSTPK:32/binary,
-                        _Z:64/binary, Nonce:8/binary, Box:80/binary>>) ->
-  #hello_packet{server_extension=SE,
-                client_extension=CE,
-                client_short_term_public_key=CSTPK,
-                nonce=Nonce,
-                box=Box};
-decode_curvecp_packet(<<?INITIATE, SE:16/binary, CE:16/binary, CSTPK:32/binary,
-                        Cookie:96/binary, Nonce:8/binary, Box/binary>>) ->
-  #initiate_packet{server_extension=SE, client_extension=CE,
-                   client_short_term_public_key=CSTPK,
-                   cookie=Cookie, nonce=Nonce, box=Box};
-decode_curvecp_packet(<<?CLIENT_M, SE:16/binary, CE:16/binary, CSTPK:32/binary,
-                        Nonce:8/binary, Box/binary>>) ->
-  #client_msg_packet{server_extension=SE,
-                     client_extension=CE,
-                     client_short_term_public_key=CSTPK,
-                     nonce=Nonce,
-                     box=Box}.
-
-init([]) ->
-  {ok, #st{}}.
+  {ok, hello, State}.
 
 hello(#hello_packet{} = Hello, State) ->
   #st{handshake_ttl=Timeout} = State,
@@ -160,6 +145,27 @@ terminate(_Reason, _StateName, StateData) ->
 send(Packet, State) ->
   #st{transport=Transport, socket=Socket} = State,
   Transport:send(Socket, Packet).
+
+decode_curvecp_packet(<<?HELLO, SE:16/binary, CE:16/binary, CSTPK:32/binary,
+                        _Z:64/binary, Nonce:8/binary, Box:80/binary>>) ->
+  #hello_packet{server_extension=SE,
+                client_extension=CE,
+                client_short_term_public_key=CSTPK,
+                nonce=Nonce,
+                box=Box};
+decode_curvecp_packet(<<?INITIATE, SE:16/binary, CE:16/binary, CSTPK:32/binary,
+                        Cookie:96/binary, Nonce:8/binary, Box/binary>>) ->
+  #initiate_packet{server_extension=SE, client_extension=CE,
+                   client_short_term_public_key=CSTPK,
+                   cookie=Cookie, nonce=Nonce, box=Box};
+decode_curvecp_packet(<<?CLIENT_M, SE:16/binary, CE:16/binary, CSTPK:32/binary,
+                        Nonce:8/binary, Box/binary>>) ->
+  #client_msg_packet{server_extension=SE,
+                     client_extension=CE,
+                     client_short_term_public_key=CSTPK,
+                     nonce=Nonce,
+                     box=Box}.
+
 
 decode_hello_packet(Hello, Codec) ->
   #hello_packet{nonce=Nonce,

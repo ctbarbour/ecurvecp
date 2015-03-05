@@ -9,11 +9,12 @@ DIALYZER_PLT  = .$(PROJECT).plt
 DIALYZER_OPTS ?= -Werror_handling -Wrace_conditions -Wunmatched_returns
 PLT_APPS 		  = erts kernel stdlib sasl
 
-.PHONY: all deps shell xref doc
+.PHONY: all deps shell xref doc eunit
 
 DEPS = enacl druuid
-dep_enacl = https://github.com/jlouis/enacl.git master
-dep_druuid = https://github.com/kellymclaughlin/druuid.git master
+dep_enacl = git https://github.com/jlouis/enacl.git master
+dep_druuid = git https://github.com/kellymclaughlin/druuid.git master
+dep_proper = git https://github.com/manopapad/proper.git master
 
 all: deps compile
 
@@ -28,6 +29,9 @@ compile:
 
 xref:
 	@$(REBAR) xref skip_deps=true
+
+eunit: compile
+	@$(REBAR) eunit skip_deps=true
 
 doc: compile
 	@$(REBAR) skip_deps=true doc

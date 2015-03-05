@@ -1,6 +1,7 @@
 -module(ecurvecp).
 
--export([start_client/4, start_listener/4, stop_listener/1, extension/0]).
+-export([start_client/4, start_listener/4, stop_listener/1,
+         extension/0, keypair/0]).
 -export([get_prop_or_env/2, get_prop_or_env/3, get_env/2]).
 
 start_client(Ip, Port, ServerExtension, ServerPublicKey) ->
@@ -17,6 +18,10 @@ stop_listener(Ref) ->
 
 extension() ->
   druuid:v4().
+
+keypair() ->
+  #{public := PK, secret := SK} = enacl:box_keypair(),
+  {PK, SK}.
 
 default_listener_options() ->
   [{ip, {127,0,0,1}},
