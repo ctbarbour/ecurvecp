@@ -11,7 +11,7 @@ PLT_APPS 		  = erts kernel stdlib sasl
 
 .PHONY: all deps shell xref doc eunit
 
-DEPS = enacl druuid
+DEPS = enacl druuid proper
 dep_enacl = git https://github.com/jlouis/enacl.git master
 dep_druuid = git https://github.com/kellymclaughlin/druuid.git master
 dep_proper = git https://github.com/manopapad/proper.git master

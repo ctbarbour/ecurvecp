@@ -156,7 +156,7 @@ verify_domain_name(_DomainName) ->
 
 encode_client_msg_packet(Message, CSTPK, PK, SK, SE, CE) ->
   Nonce = ecurvecp_nonces:short_term_nonce(SK),
-  NonceString = ecurvecp_nonces:nonce_String(client_message, Nonce),
+  NonceString = ecurvecp_nonces:nonce_string(client_message, Nonce),
   Box = enacl:box(Message, NonceString, PK, SK),
   <<?CLIENT_M, SE/binary, CE/binary, CSTPK/binary, Nonce/binary, Box/binary>>.
 
