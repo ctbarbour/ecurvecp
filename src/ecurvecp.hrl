@@ -12,6 +12,14 @@
     box
   }).
 
+-record(cookie_packet, {
+    server_extension,
+    client_extension,
+    cookie,
+    nonce,
+    box
+  }).
+
 -record(initiate_packet, {
     server_extension,
     client_extension,
@@ -25,6 +33,13 @@
     server_extension,
     client_extension,
     client_short_term_public_key,
+    nonce,
+    box
+  }).
+
+-record(server_msg_packet, {
+    server_extension,
+    client_extension,
     nonce,
     box
   }).

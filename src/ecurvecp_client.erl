@@ -1,10 +1,15 @@
 -module(ecurvecp_client).
 -behavior(gen_fsm).
 
--export([start_link/6, start_link/7, request/2, stop/1]).
+-export([start_link/6, start_link/7, request/2, stop/1, send_event/2]).
+-export([new_codec/5,
+         encode_hello_packet/1,
+         encode_initiate_packet/1,
+         encode_client_message_packet/2,
+         decode_curvecp_packet/1]).
 -export([init/1, handle_event/3, handle_sync_event/4, handle_info/3,
          code_change/4, terminate/3]).
--export([connect/2, cookie/2, ready/2, finalize/2, message/2, message/3]).
+-export([connect/2, cookie/2, ready/2, finalize/2, established/2, established/3]).
 
 -define(SERVER_DOMAIN, "apple.com").
 
@@ -35,19 +40,12 @@
     owner
   }).
 
--record(cookie_packet, {
-    client_extension,
-    server_extension,
-    nonce,
-    box
-  }).
-
--record(server_msg_packet, {
-    client_extension,
-    server_extension,
-    nonce,
-    box
-  }).
+new_codec(CLTPK, CLTSK, CE, SLTPK, SE) ->
+  #codec{server_long_term_public_key=SLTPK,
+         client_long_term_public_key=CLTPK,
+         client_long_term_secret_key=CLTSK,
+         server_extension=SE,
+         client_extension=CE}.
 
 start_link(#{public := CLTPK, secret := CLTSK}, Owner, Ip, Port, ServerExt, SLTPK) ->
   start_link(CLTPK, CLTSK, Owner, Ip, Port, ServerExt, SLTPK).
@@ -73,18 +71,19 @@ generate_shared_key(Codec) ->
   SharedKey = enacl:box_beforenm(SSTPK, CSTSK),
   Codec#codec{shared_key=SharedKey}.
 
-init([CLTPK, CLTSK, Owner, Ip, Port, ServerExt, SLTPK]) ->
-  ClientExtension = ecurvecp:extension(),
+send_event(Pid, Packet) ->
+  gen_fsm:send_event(Pid, decode_curvecp_packet(Packet)).
+
+init([CLTPK, CLTSK, Owner, Ip, Port, SE, SLTPK]) ->
+  CE = ecurvecp:extension(),
+  Codec = generate_short_term_keypair(new_codec(CLTPK, CLTSK, CE, SLTPK, SE)),
+  _MRef = erlang:monitor(process, Owner),
+
   Transport = ranch_tcp,
   SocketOpts = [binary, {active, false}],
   {ok, Socket} = Transport:connect(Ip, Port, SocketOpts),
-  Codec = generate_short_term_keypair(#codec{client_extension=ClientExtension,
-                                             server_extension=ServerExt,
-                                             client_long_term_public_key=CLTPK,
-                                             client_long_term_secret_key=CLTSK,
-                                             server_long_term_public_key=SLTPK}),
-  _MRef = erlang:monitor(process, Owner),
   ok = Transport:setopts(Socket, [{packet, 4}, {active, once}]),
+
   State = #st{ip=Ip, port=Port, transport=Transport, socket=Socket,
               codec=Codec, owner=Owner},
   {ok, connect, State, 0}.
@@ -126,17 +125,17 @@ ready(timeout, State) ->
 finalize(timeout, State) ->
   #st{ttl=Timeout} = State,
   Codec = generate_shared_key(State#st.codec),
-  {next_state, message, State#st{codec=Codec}, Timeout}.
+  {next_state, established, State#st{codec=Codec}, Timeout}.
 
-message(#server_msg_packet{} = Packet, State) ->
+established(#server_msg_packet{} = Packet, State) ->
   #st{ttl=Timeout, from=From} = State,
   {ok, Message, Codec} = decode_server_message_packet(Packet, State#st.codec),
   _ = gen_fsm:reply(From, Message),
-  {next_state, message, State#st{codec=Codec, from=undefined}, Timeout};
-message(timeout, State) ->
-  {stop, timeout, State}.
+  {next_state, established, State#st{codec=Codec, from=undefined}, Timeout};
+established(timeout, State) ->
+  {stop, established, State}.
 
-message({message, Message}, From, State) ->
+established({message, Message}, From, State) ->
   #st{ttl=Timeout, codec=Codec} = State,
   Packet = encode_client_message_packet(Message, Codec),
   ok = send(Packet, State),
@@ -191,9 +190,9 @@ decode_cookie_packet(Packet, Codec) ->
   #cookie_packet{client_extension=CE, server_extension=SE,
                  nonce=Nonce, box=Box} = Packet,
   true = verify_extensions(CE, SE, Codec),
-  decode_cookie_body(Nonce, Box, Codec).
+  decode_cookie_box(Nonce, Box, Codec).
 
-decode_cookie_body(Nonce, Box, Codec) ->
+decode_cookie_box(Nonce, Box, Codec) ->
   #codec{server_long_term_public_key=SLTPK,
          client_short_term_secret_key=CSTSK} = Codec,
   NonceString = ecurvecp_nonces:nonce_string(cookie, Nonce),
@@ -205,12 +204,12 @@ decode_cookie_box_contents(<<SSTPK:32/binary, Cookie:96/binary>>, Codec) ->
 
 encode_initiate_packet(Codec) ->
   #codec{server_short_term_public_key=SSTPK,
-                client_long_term_public_key=CLTPK,
-                client_short_term_public_key=CSTPK,
-                client_short_term_secret_key=CSTSK,
-                server_extension=SE,
-                client_extension=CE,
-                cookie=Cookie} = Codec,
+         client_long_term_public_key=CLTPK,
+         client_short_term_public_key=CSTPK,
+         client_short_term_secret_key=CSTSK,
+         server_extension=SE,
+         client_extension=CE,
+         cookie=Cookie} = Codec,
   Vouch = encode_vouch(Codec),
   DomainName = encode_domain_name(),
   PlainText = <<CLTPK/binary, Vouch/binary, DomainName/binary, "CurveCPI">>,
@@ -221,8 +220,8 @@ encode_initiate_packet(Codec) ->
 
 encode_vouch(Codec) ->
   #codec{client_short_term_public_key=CSTPK,
-                server_long_term_public_key=SLTPK,
-                client_long_term_secret_key=CLTSK} = Codec,
+         server_long_term_public_key=SLTPK,
+         client_long_term_secret_key=CLTSK} = Codec,
   Nonce = ecurvecp_nonces:long_term_nonce_counter(CLTSK),
   NonceString = ecurvecp_nonces:nonce_string(vouch, Nonce),
   Box = enacl:box(CSTPK, NonceString, SLTPK, CLTSK),
@@ -231,17 +230,11 @@ encode_vouch(Codec) ->
 encode_client_message_packet(Message, Codec) ->
   #codec{server_extension=SE,
          client_extension=CE,
-         server_short_term_public_key=SSTPK,
-         client_short_term_secret_key=CSTSK,
          client_short_term_public_key=CSTPK,
          shared_key=SharedKey} = Codec,
   Nonce = ecurvecp_nonces:short_term_nonce(SharedKey),
   NonceString = ecurvecp_nonces:nonce_string(client_message, Nonce),
-  Box = if SharedKey =:= undefined ->
-      enacl:box(Message, NonceString, SSTPK, CSTSK);
-    true ->
-      enacl:box_afternm(Message, NonceString, SharedKey)
-  end,
+  Box = enacl:box_afternm(Message, NonceString, SharedKey),
   <<?CLIENT_M, SE/binary, CE/binary, CSTPK/binary, Nonce/binary, Box/binary>>.
 
 decode_server_message_packet(Packet, Codec) ->

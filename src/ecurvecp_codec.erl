@@ -2,135 +2,60 @@
 
 -include("ecurvecp.hrl").
 
--export([new_client_codec/5,
-         new_server_codec/3,
-         encode_hello_packet/1,
-         encode_cookie_packet/1,
-         decode_curvecp_packet/2,
-         generate_short_term_keypair/1,
-         rotate_minute_keys/1,
-         generate_minute_key/0]).
+-export([encode_hello_packet/5,
+         encode_cookie_packet/6,
+         encode_cookie/3,
+         encode_initiate_packet/9,
+         encode_vouch/3,
+         encode_domain_name/1,
+         encode_client_msg_packet/5,
+         encode_client_msg_packet/6,
+         encode_server_msg_packet/4,
+         encode_server_msg_packet/5,
+         decode_hello_packet/1,
+         decode_cookie_packet/1,
+         decode_cookie_box/3,
+         decode_cookie_box_contents/1,
+         decode_initiate_packet/1,
+         decode_initiate_box/3,
+         decode_server_msg_packet/1,
+         decode_server_msg_box/2,
+         decode_server_msg_box/3,
+         decode_client_msg_packet/1,
+         decode_client_msg_box/2,
+         decode_client_msg_box/3,
+         verify_cookie/2,
+         verify_initiate_box_contents/3,
+         verify_hello_box/2,
+         keypair/0,
+         shared_key/2,
+         minute_key/0]).
 
--ifdef(TEST).
--export([validate_codec_pair/3]).
--endif.
+keypair() ->
+  #{public := PK, secret := SK} = enacl:box_keypair(),
+  {PK, SK}.
 
--record(server_codec, {
-    server_long_term_public_key,
-    server_long_term_secret_key,
-    server_short_term_public_key,
-    server_short_term_secret_key,
-    client_long_term_public_key,
-    client_short_term_public_key,
-    minute_key,
-    prev_minute_key,
-    shared_key,
-    cookie,
-    server_extension,
-    client_extension
-  }).
-
--record(client_codec, {
-    client_long_term_public_key,
-    client_long_term_secret_key,
-    client_short_term_public_key,
-    client_short_term_secret_key,
-    server_long_term_public_key,
-    server_short_term_public_key,
-    cookie,
-    shared_key,
-    client_extension,
-    server_extension
-  }).
-
--opaque client_codec()  :: #client_codec{}.
--opaque server_codec()  :: #server_codec{}.
-
--export_type([client_codec/0, server_codec/0]).
-
-new_client_codec(CLTPK, CLTSK, CE, SLTPK, SE) ->
-  #client_codec{server_long_term_public_key=SLTPK,
-                client_long_term_public_key=CLTPK,
-                client_long_term_secret_key=CLTSK,
-                server_extension=SE,
-                client_extension=CE}.
-
-new_server_codec(SLTPK, SLTSK, SE) ->
-  #server_codec{server_long_term_public_key=SLTPK,
-                server_long_term_secret_key=SLTSK,
-                server_extension=SE}.
-
-generate_short_term_keypair(#client_codec{} = Codec) ->
-  #{public := CSTPK, secret := CSTSK} = enacl:box_keypair(),
-  Codec#client_codec{client_short_term_public_key=CSTPK,
-                     client_short_term_secret_key=CSTSK};
-generate_short_term_keypair(#server_codec{} = Codec) ->
-  #{public := SSTPK, secret := SSTSK} = enacl:box_keypair(),
-  Codec#server_codec{server_short_term_public_key=SSTPK,
-                     server_short_term_secret_key=SSTSK}.
-
-rotate_minute_keys(#server_codec{minute_key=undefined} = Codec) ->
-  MinuteKey = generate_minute_key(),
-  rotate_minute_keys(Codec#server_codec{minute_key=MinuteKey});
-rotate_minute_keys(#server_codec{} = Codec) ->
-  #server_codec{minute_key=PrevMinuteKey} = Codec,
-  MinuteKey = generate_minute_key(),
-  _Ref = erlang:send_after(60000, self(), rotate),
-  Codec#server_codec{minute_key=MinuteKey, prev_minute_key=PrevMinuteKey}.
-
-generate_minute_key() ->
+minute_key() ->
   enacl:randombytes(32).
 
-encode_hello_packet(Codec) ->
-  #client_codec{server_long_term_public_key=SLTPK,
-                client_short_term_public_key=CSTPK,
-                client_short_term_secret_key=CSTSK,
-                server_extension=SE,
-                client_extension=CE} = Codec,
+shared_key(PK, SK) ->
+  enacl:box_beforenm(PK, SK).
 
+encode_hello_packet(CSTPK, CSTSK, SLTPK, SE, CE) ->
   Zeros = binary:copy(<<0>>, 64),
   Nonce = ecurvecp_nonces:short_term_nonce(CSTSK),
   NonceString = ecurvecp_nonces:nonce_string(hello, Nonce),
   Box = enacl:box(Zeros, NonceString, SLTPK, CSTSK),
   <<?HELLO, SE/binary, CE/binary, CSTPK/binary, Zeros/binary, Nonce/binary, Box/binary>>.
 
-encode_cookie_packet(#server_codec{} = Codec) ->
-  #server_codec{client_short_term_public_key=CSTPK,
-                server_long_term_secret_key=SLTSK,
-                server_short_term_public_key=SSTPK,
-                minute_key=MK,
-                client_extension=CE,
-                server_extension=SE} = Codec,
+decode_hello_packet(<<?HELLO, SE:16/binary, CE:16/binary, CSTPK:32/binary,
+                      _Z:64/binary, Nonce:8/binary, Box:80/binary>>) ->
+  #hello_packet{server_extension=SE, client_extension=CE,
+                client_short_term_public_key=CSTPK,
+                nonce=Nonce, box=Box}.
 
-  Nonce = ecurvecp_nonces:long_term_nonce_counter(SLTSK),
-  NonceString = ecurvecp_nonces:nonce_string(cookie, Nonce),
-  Cookie = encode_cookie(CSTPK, SSTPK, MK),
-  PlainText = <<SSTPK/binary, Cookie/binary>>,
-  Box = enacl:box(PlainText, NonceString, CSTPK, SLTSK),
-  <<?COOKIE, CE/binary, SE/binary, Nonce/binary, Box/binary>>.
-
-encode_cookie(ClientShortTermPubKey, ServerShortTermSecKey, MinuteKey) ->
-  Msg = <<ClientShortTermPubKey/binary, ServerShortTermSecKey/binary>>,
-  Nonce = ecurvecp_nonces:long_term_nonce_timestamp(),
-  NonceString = ecurvecp_nonces:nonce_string(minute_key, Nonce),
-  Box = enacl:secretbox(Msg, NonceString, MinuteKey),
-  <<Nonce/binary, Box/binary>>.
-
-
-decode_curvecp_packet(<<?HELLO, SE:16/binary, CE:16/binary, CSTPK:32/binary,
-                        _Z:64/binary, Nonce:8/binary, Box:80/binary>>,
-                      #server_codec{} = Codec) ->
-  true = decode_hello_packet_box(Nonce, Box, CSTPK, Codec),
-  Codec#server_codec{server_extension=SE, client_extension=CE,
-                     client_short_term_public_key=CSTPK};
-
-decode_curvecp_packet(<<?COOKIE, _CE:16/binary, _SE:16/binary,
-                        Nonce:16/binary,
-                        Box:144/binary>>, #client_codec{} = Codec) ->
-  decode_cookie_body(Nonce, Box, Codec).
-
-decode_hello_packet_box(Nonce, Box, CSTPK, Codec) ->
-  #server_codec{server_long_term_secret_key=SLTSK} = Codec,
+verify_hello_box(Hello, SLTSK) ->
+  #hello_packet{client_short_term_public_key=CSTPK, nonce=Nonce, box=Box} = Hello,
   NonceString = ecurvecp_nonces:nonce_string(hello, Nonce),
   {ok, Contents} = enacl:box_open(Box, NonceString, CSTPK, SLTSK),
   verify_hello_box_contents(Contents).
@@ -141,42 +66,145 @@ verify_hello_box_contents(<<First:32/binary, Second:32/binary>>) ->
 verify_hello_box_contents(_Contents) ->
   false.
 
-decode_cookie_body(Nonce, Box, Codec) ->
-  #client_codec{server_long_term_public_key=SLTPK,
-                client_short_term_secret_key=CSTSK} = Codec,
+encode_cookie(CSTPK, SSTSK, MK) ->
+  Msg = <<CSTPK/binary, SSTSK/binary>>,
+  Nonce = ecurvecp_nonces:long_term_nonce_timestamp(),
+  NonceString = ecurvecp_nonces:nonce_string(minute_key, Nonce),
+  Box = enacl:secretbox(Msg, NonceString, MK),
+  <<Nonce/binary, Box/binary>>.
+
+encode_cookie_packet(CSTPK, SSTPK, SLTSK, Cookie, SE, CE) ->
+  Nonce = ecurvecp_nonces:long_term_nonce_counter(SLTSK),
   NonceString = ecurvecp_nonces:nonce_string(cookie, Nonce),
-  {ok, Contents} = enacl:box_open(Box, NonceString, SLTPK, CSTSK),
-  decode_cookie_box_contents(Contents, Codec).
+  PlainText = <<SSTPK/binary, Cookie/binary>>,
+  ok = error_logger:info_msg("[~p] CSTPK: ~p~nSLTSK: ~p~n", [self(), CSTPK, SLTSK]),
+  Box = enacl:box(PlainText, NonceString, CSTPK, SLTSK),
+  <<?COOKIE, CE/binary, SE/binary, Nonce/binary, Box/binary>>.
 
-decode_cookie_box_contents(<<SSTPK:32/binary, Cookie:96/binary>>, Codec) ->
-  Codec#client_codec{server_short_term_public_key=SSTPK, cookie=Cookie}.
+decode_cookie_packet(<<?COOKIE, CE:16/binary, SE:16/binary,
+                       Nonce:16/binary, Box:144/binary>>) ->
+  #cookie_packet{client_extension=CE, server_extension=SE,
+                 nonce=Nonce, box=Box}.
 
--ifdef(TEST).
+decode_cookie_box(CookiePacket, PK, SK) ->
+  #cookie_packet{nonce=Nonce, box=Box} = CookiePacket,
+  NonceString = ecurvecp_nonces:nonce_string(cookie, Nonce),
+  {ok, Contents} = enacl:box_open(Box, NonceString, PK, SK),
+  decode_cookie_box_contents(Contents).
 
-validate_codec_pair(_CC, _SC, []) ->
+decode_cookie_box_contents(<<SSTPK:32/binary, Cookie:96/binary>>) ->
+  #{server_short_term_public_key => SSTPK, cookie => Cookie}.
+
+encode_vouch(CLTSK, CSTPK, SLTPK) ->
+  Nonce = ecurvecp_nonces:long_term_nonce_counter(CLTSK),
+  NonceString = ecurvecp_nonces:nonce_string(vouch, Nonce),
+  Box = enacl:box(CSTPK, NonceString, SLTPK, CLTSK),
+  <<Nonce/binary, Box/binary>>.
+
+encode_domain_name(DomainName) ->
+  Bin = list_to_binary(DomainName),
+  case (256 - size(Bin) rem 256) rem 256 of
+    0 ->
+      Bin;
+    N ->
+      <<Bin/binary, 0:(N*8)>>
+  end.
+
+encode_initiate_packet(CLTPK, CSTPK, CSTSK, SSTPK, Vouch, Cookie, DomainName, SE, CE) ->
+  PlainText = <<CLTPK/binary, Vouch/binary, DomainName/binary, "CurveCPI">>,
+  Nonce = ecurvecp_nonces:short_term_nonce(CSTSK),
+  NonceString = ecurvecp_nonces:nonce_string(initiate, Nonce),
+  Box = enacl:box(PlainText, NonceString, SSTPK, CSTSK),
+  <<?INITIATE, SE/binary, CE/binary, CSTPK/binary, Cookie/binary, Nonce/binary, Box/binary>>.
+
+decode_initiate_packet(<<?INITIATE, SE:16/binary, CE:16/binary, CSTPK:32/binary,
+                        Cookie:96/binary, Nonce:8/binary, Box/binary>>) ->
+  #initiate_packet{server_extension=SE, client_extension=CE,
+                   client_short_term_public_key=CSTPK,
+                   cookie=Cookie, nonce=Nonce, box=Box}.
+
+decode_initiate_box(Initiate, PK, SK) ->
+  #initiate_packet{nonce=Nonce, box=Box} = Initiate,
+  NonceString = ecurvecp_nonces:nonce_string(initiate, Nonce),
+  {ok, Contents} = enacl:box_open(Box, NonceString, PK, SK),
+  Contents.
+
+verify_cookie(_, []) ->
   false;
-validate_codec_pair(CC, SC, [H]) when is_atom(H) ->
-  validate_codec_pair(CC, SC, H);
-validate_codec_pair(CC, SC, [H|T]) ->
-  case validate_codec_pair(CC, SC, H) of
-    true ->
-      validate_codec_pair(CC, SC, T);
-    false ->
-      false
-  end;
-validate_codec_pair(CC, SC, client_extension) ->
-  CC#client_codec.client_extension =:= SC#server_codec.client_extension;
-validate_codec_pair(CC, SC, server_extension) ->
-  CC#client_codec.server_extension =:= SC#server_codec.server_extension;
-validate_codec_pair(CC, SC, server_long_term_public_key) ->
-  CC#client_codec.server_long_term_public_key =:= SC#server_codec.server_long_term_public_key;
-validate_codec_pair(CC, SC, server_short_term_public_key) ->
-  CC#client_codec.server_short_term_public_key =:= SC#server_codec.server_short_term_public_key;
-validate_codec_pair(CC, SC, client_long_term_public_key) ->
-  CC#client_codec.client_long_term_public_key =:= SC#server_codec.client_long_term_public_key;
-validate_codec_pair(CC, SC, client_short_term_public_key) ->
-  CC#client_codec.client_short_term_public_key =:= SC#server_codec.client_short_term_public_key;
-validate_codec_pair(CC, SC, cookie) ->
-  CC#client_codec.cookie =:= SC#server_codec.cookie.
+verify_cookie(Initiate, [MK|PMK]) ->
+  #initiate_packet{cookie= <<Nonce:16/binary, Box/binary>>, client_short_term_public_key=CSTPK} = Initiate,
+  NonceString = ecurvecp_nonces:nonce_string(minute_key, Nonce),
+  case enacl:secretbox_open(Box, NonceString, MK) of
+    {ok, <<BoxedCSTPK:32/binary, _:32/binary>>} ->
+      enacl:verify_32(BoxedCSTPK, CSTPK);
+    _ ->
+      verify_cookie(Initiate, PMK)
+  end.
 
--endif.
+verify_initiate_box_contents(<<CLTPK:32/binary, Vouch:64/binary,
+                               DomainName:256/binary, _Message/binary>>, CSTPK, SLTPK) ->
+  verify_vouch(Vouch, CLTPK, CSTPK, SLTPK) andalso
+    verify_domain_name(DomainName).
+
+verify_vouch(<<Nonce:16/binary, Box:48/binary>>, CLTPK, CSTPK, SLTPK) ->
+  NonceString = ecurvecp_nonces:nonce_string(vouch, Nonce),
+  {ok, VouchedCSTPK} = enacl:box_open(Box, NonceString, CLTPK, SLTPK),
+  enacl:verify_32(VouchedCSTPK, CSTPK).
+
+verify_domain_name(_DomainName) ->
+  true.
+
+encode_client_msg_packet(Message, CSTPK, PK, SK, SE, CE) ->
+  Nonce = ecurvecp_nonces:short_term_nonce(SK),
+  NonceString = ecurvecp_nonces:nonce_String(client_message, Nonce),
+  Box = enacl:box(Message, NonceString, PK, SK),
+  <<?CLIENT_M, SE/binary, CE/binary, CSTPK/binary, Nonce/binary, Box/binary>>.
+
+encode_client_msg_packet(Message, CSTPK, SharedKey, SE, CE) ->
+  Nonce = ecurvecp_nonces:short_term_nonce(SharedKey),
+  NonceString = ecurvecp_nonces:nonce_string(client_message, Nonce),
+  Box = enacl:box_afternm(Message, NonceString, SharedKey),
+  <<?CLIENT_M, SE/binary, CE/binary, CSTPK/binary, Nonce/binary, Box/binary>>.
+
+decode_client_msg_packet(<<?CLIENT_M, CE:16/binary, SE:16/binary, Nonce:8/binary, Box/binary>>) ->
+  #client_msg_packet{client_extension=CE, server_extension=SE,
+                     nonce=Nonce, box=Box}.
+
+decode_client_msg_box(ClientMsg, SharedKey) ->
+  #client_msg_packet{nonce=Nonce, box=Box} = ClientMsg,
+  NonceString = ecurvecp_nonces:nonce_string(client_message, Nonce),
+  enacl:box_open_afternm(Box, NonceString, SharedKey).
+
+decode_client_msg_box(ClientMsg, PK, SK) ->
+  #client_msg_packet{nonce=Nonce, box=Box} = ClientMsg,
+  NonceString = ecurvecp_nonces:nonce_string(client_message, Nonce),
+  enacl:box_open(Box, NonceString, PK, SK).
+
+encode_server_msg_packet(Message, CSTPK, SSTSK, SE, CE) ->
+  Nonce = ecurvecp_nonces:short_term_nonce(SSTSK),
+  NonceString = ecurvecp_nonces:nonce_string(server_message, Nonce),
+  Box = enacl:box(Message, NonceString, CSTPK, SSTSK),
+  <<?SERVER_M, CE/binary, SE/binary, Nonce/binary, Box/binary>>.
+
+encode_server_msg_packet(Message, SharedKey, SE, CE) ->
+  Nonce = ecurvecp_nonces:short_term_nonce(SharedKey),
+  NonceString = ecurvecp_nonces:nonce_string(server_message, Nonce),
+  Box = enacl:box_afternm(Message, NonceString, SharedKey),
+  <<?SERVER_M, CE/binary, SE/binary, Nonce/binary, Box/binary>>.
+
+decode_server_msg_packet(<<?SERVER_M, CE:16/binary, SE:16/binary, Nonce:8/binary,
+                           Box/binary>>) ->
+  #server_msg_packet{client_extension=CE,
+                     server_extension=SE,
+                     nonce=Nonce,
+                     box=Box}.
+
+decode_server_msg_box(ServerMsg, SharedKey) ->
+  #server_msg_packet{nonce=Nonce, box=Box} = ServerMsg,
+  NonceString = ecurvecp_nonces:nonce_string(server_message, Nonce),
+  enacl:box_open_afternm(Box, NonceString, SharedKey).
+
+decode_server_msg_box(ServerMsg, PK, SK) ->
+  #server_msg_packet{nonce=Nonce, box=Box} = ServerMsg,
+  NonceString = ecurvecp_nonces:nonce_string(server_message, Nonce),
+  enacl:box_open(Box, NonceString, PK, SK).

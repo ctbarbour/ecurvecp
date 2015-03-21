@@ -33,6 +33,9 @@ xref:
 eunit: compile
 	@$(REBAR) eunit skip_deps=true
 
+ct: compile
+	@$(REBAR) ct skip_deps=true
+
 doc: compile
 	@$(REBAR) skip_deps=true doc
 

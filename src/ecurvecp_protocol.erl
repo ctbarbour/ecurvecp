@@ -2,10 +2,10 @@
 -behavior(gen_fsm).
 -behavior(ranch_protocol).
 
--export([start_link/3, start_link/4, init/4, reply/2, default_options/0]).
+-export([start_link/3, start_link/4, init/4, reply/2, default_options/0, stop/1]).
 -export([init/1, handle_event/3, handle_sync_event/4, handle_info/3,
          code_change/4, terminate/3]).
--export([hello/2, initiate/2, finalize/2, message/2, message/3]).
+-export([hello/2, initiate/2, finalize/2, established/2, established/3]).
 
 -include("ecurvecp.hrl").
 
@@ -48,10 +48,13 @@ reply(Pid, Message) ->
   gen_fsm:send_event(Pid, {reply, Message}).
 
 start_link(Socket, Transport, Opts) ->
-  gen_fsm:start_link(?MODULE, [Socket, Transport, Opts], []).
+  gen_fsm:start_link(?MODULE, [Socket, Transport, proplists:unfold(Opts)], []).
 
 start_link(Ref, Socket, Transport, Opts) ->
   proc_lib:start_link(?MODULE, init, [Ref, Socket, Transport, Opts]).
+
+stop(Pid) ->
+  gen_fsm:sync_send_all_state_event(Pid, stop).
 
 init(Ref, Socket, Transport, Opts) ->
   ok = proc_lib:init_ack({ok, self()}),
@@ -63,28 +66,39 @@ init([Socket, Transport, Opts]) ->
   ok = Transport:setopts(Socket, socket_options()),
 
   #{public := SLTPK, secret := SLTSK} = proplists:get_value(server_keypair, Opts),
+  #{public := SSTPK, secret := SSTSK} = proplists:get_value(server_short_term_keypair, Opts, #{public => undefined, secret => undefined}),
+  MinuteKey = proplists:get_value(minute_key, Opts, undefined),
+
   ServerExtension = proplists:get_value(server_extension, Opts),
 
-  Codec = rotate_minute_keys(
-      #codec{server_long_term_public_key=SLTPK,
-             server_long_term_secret_key=SLTSK,
-             server_extension=ServerExtension}),
-
+  Codec0 = #codec{server_long_term_public_key=SLTPK,
+                  server_long_term_secret_key=SLTSK,
+                  server_short_term_public_key=SSTPK,
+                  server_short_term_secret_key=SSTSK,
+                  minute_key=MinuteKey,
+                  prev_minute_key=MinuteKey,
+                  server_extension=ServerExtension},
+  Codec = case MinuteKey of
+    undefined ->
+      rotate_minute_keys(Codec0);
+    _ ->
+      Codec0
+  end,
   State = #st{socket=Socket, transport=Transport, codec=Codec},
   {ok, hello, State}.
 
-hello(#hello_packet{} = Hello, State) ->
+hello(<<?HELLO, _/binary>> = Packet, State) ->
   #st{handshake_ttl=Timeout} = State,
-  Codec = generate_short_term_keys(
-      decode_hello_packet(Hello, State#st.codec)),
+  Codec = generate_short_term_keys(decode_hello_packet(
+        decode_curvecp_packet(Packet), State#st.codec)),
   CookiePacket = encode_cookie_packet(Codec),
   ok = send(CookiePacket, State),
   {next_state, initiate, State#st{codec=Codec}, Timeout};
 hello(timeout, State) ->
   {stop, timeout, State}.
 
-initiate(#initiate_packet{} = Initiate, State) ->
-  Codec = decode_initiate_packet(Initiate, State#st.codec),
+initiate(<<?INITIATE, _/binary>> = Packet, State) ->
+  Codec = decode_initiate_packet(decode_curvecp_packet(Packet), State#st.codec),
   MessagePacket = encode_server_message_packet(<<"Welcome">>, Codec),
   ok = send(MessagePacket, State),
   {next_state, finalize, State#st{codec=Codec}, 0};
@@ -94,26 +108,29 @@ initiate(timeout, State) ->
 finalize(timeout, State) ->
   #st{ttl=Timeout} = State,
   Codec = generate_shared_key(State#st.codec),
-  {next_state, message, State#st{codec=Codec}, Timeout}.
+  {next_state, established, State#st{codec=Codec}, Timeout}.
 
-message(#client_msg_packet{} = Packet, State) ->
+established(<<?CLIENT_M, _/binary>> = Packet, State) ->
   #st{ttl=Timeout} = State,
-  {ok, ClientM, Codec} = decode_client_message_packet(Packet, State#st.codec),
+  {ok, ClientM, Codec} = decode_client_message_packet(
+      decode_curvecp_packet(Packet), State#st.codec),
   ServerMessagePacket = encode_server_message_packet(ClientM, Codec),
   ok = send(ServerMessagePacket, State),
-  {next_state, message, State#st{codec=Codec}, Timeout};
-message(timeout, State) ->
+  {next_state, established, State#st{codec=Codec}, Timeout};
+established(timeout, State) ->
   {stop, timeout, State}.
 
-message({reply, Message}, _From, State) ->
+established({reply, Message}, _From, State) ->
   #st{ttl=Timeout} = State,
   ServerMessagePacket = encode_server_message_packet(Message, State#st.codec),
   ok = send(ServerMessagePacket, State),
-  {next_state, message, State, Timeout}.
+  {next_state, established, State, Timeout}.
 
 handle_event(_Event, StateName, StateData) ->
   {next_state, StateName, StateData}.
 
+handle_sync_event(stop, _From, _StateName, StateData) ->
+  {stop, normal, ok, StateData};
 handle_sync_event(_Event, _From, StateName, StateData) ->
   {next_state, StateName, StateData}.
 
@@ -125,7 +142,7 @@ handle_info(Info, StateName, StateData) ->
   {Ok, Closed, Error} = Transport:messages(),
   case Info of
     {Ok, Socket, Packet} ->
-      ?MODULE:StateName(decode_curvecp_packet(Packet), active_once(StateData));
+      ?MODULE:StateName(Packet, active_once(StateData));
     {Error, Socket} ->
       {stop, Error, StateData};
     {Closed, Socket} ->
@@ -173,11 +190,11 @@ decode_hello_packet(Hello, Codec) ->
                 client_short_term_public_key=CSTPK,
                 server_extension=SE,
                 client_extension=CE} = Hello,
-  true = decode_hello_packet_box(Nonce, Box, CSTPK, Codec),
+  true = verify_hello_packet_box(Nonce, Box, CSTPK, Codec),
   Codec#codec{server_extension=SE, client_extension=CE,
               client_short_term_public_key=CSTPK}.
 
-decode_hello_packet_box(Nonce, Box, CSTPK, Codec) ->
+verify_hello_packet_box(Nonce, Box, CSTPK, Codec) ->
   #codec{server_long_term_secret_key=SLTSK} = Codec,
   NonceString = ecurvecp_nonces:nonce_string(hello, Nonce),
   {ok, Contents} = enacl:box_open(Box, NonceString, CSTPK, SLTSK),
@@ -202,6 +219,8 @@ encode_cookie_packet(Codec) ->
   Cookie = encode_cookie(CSTPK, SSTPK, MK),
   PlainText = <<SSTPK/binary, Cookie/binary>>,
   Box = enacl:box(PlainText, NonceString, CSTPK, SLTSK),
+  ok = error_logger:info_msg("[~p] CSTPK: ~p~nSLTSK: ~p~n", [self(), CSTPK, SLTSK]),
+  ok = error_logger:info_msg("[~p] Nonce: ~p~nBox: ~p~n", [self(), Nonce, Box]),
   <<?COOKIE, CE/binary, SE/binary, Nonce/binary, Box/binary>>.
 
 encode_cookie(ClientShortTermPubKey, ServerShortTermSecKey, MinuteKey) ->
@@ -220,15 +239,20 @@ decode_initiate_packet(Initiate, Codec) ->
   decode_initiate_box(Nonce, Box, Codec).
 
 verify_cookie(<<Nonce:16/binary, Box:80/binary>>, CSTPK, Codec) ->
-  % TODO: check both minute key and prev minute key
-  #codec{minute_key=MK, prev_minute_key=_PMK} = Codec,
+  #codec{minute_key=MK, prev_minute_key=PMK} = Codec,
   NonceString = ecurvecp_nonces:nonce_string(minute_key, Nonce),
+  minute_key_cookie_verify(NonceString, Box, CSTPK, [MK, PMK]).
+
+minute_key_cookie_verify(_, _, _, []) ->
+  false;
+minute_key_cookie_verify(NonceString, Box, CSTPK, [MK|PMK]) ->
   case enacl:secretbox_open(Box, NonceString, MK) of
     {ok, <<BoxedCSTPK:32/binary, _:32/binary>>} ->
       enacl:verify_32(BoxedCSTPK, CSTPK);
     _ ->
-      false
+      minute_key_cookie_verify(NonceString, Box, CSTPK, PMK)
   end.
+
 
 decode_initiate_box(Nonce, Box, Codec) ->
   #codec{client_short_term_public_key=CSTPK,
@@ -267,8 +291,7 @@ encode_server_message_packet(Message, Codec) ->
 
   Nonce = ecurvecp_nonces:short_term_nonce(SSTSK),
   NonceString = ecurvecp_nonces:nonce_string(server_message, Nonce),
-  Box = if
-    SharedKey =:= undefined ->
+  Box = if SharedKey =:= undefined ->
       enacl:box(Message, NonceString, CSTPK, SSTSK);
     true ->
       enacl:box_afternm(Message, NonceString, SharedKey)
@@ -300,9 +323,16 @@ generate_minute_key() ->
   enacl:randombytes(32).
 
 generate_short_term_keys(Codec) ->
-  #{public := SSTPK, secret := SSTSK} = enacl:box_keypair(),
-  Codec#codec{server_short_term_public_key=SSTPK,
-              server_short_term_secret_key=SSTSK}.
+  #codec{server_short_term_public_key=PK,
+         server_short_term_secret_key=SK} = Codec,
+  case {PK, SK} of
+    {undefined, undefined} ->
+      #{public := SSTPK, secret := SSTSK} = enacl:box_keypair(),
+      Codec#codec{server_short_term_public_key=SSTPK,
+                  server_short_term_secret_key=SSTSK};
+    _ ->
+      Codec
+  end.
 
 rotate_minute_keys(#codec{minute_key=undefined} = Codec) ->
   MinuteKey = generate_minute_key(),

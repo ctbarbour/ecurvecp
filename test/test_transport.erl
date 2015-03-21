@@ -1,8 +1,10 @@
 -module(test_transport).
 
--export([setopts/2, send/2, messages/0, close/1]).
+-export([setopts/2, messages/0, close/1, send/2]).
 
-setopts(_Socket, _Opts) -> ok.
-send(_Socket, _Msg) -> ok.
+setopts(_, _) -> ok.
 messages() -> {ok, closed, error}.
-close(_Socket) -> ok.
+close(_) -> ok.
+send(Socket, Packet) ->
+  Socket ! {?MODULE, self(), Packet},
+  ok.
