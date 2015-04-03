@@ -2,6 +2,8 @@ PROJECT ?= $(notdir $(CURDIR))
 PROJECT := $(strip $(PROJECT))
 ERL 		= $(shell which erl)
 
+SNAME ?= $(PROJECT)
+
 REBAR		?= ./rebar
 export REBAR
 
@@ -10,11 +12,6 @@ DIALYZER_OPTS ?= -Werror_handling -Wrace_conditions -Wunmatched_returns
 PLT_APPS 		  = erts kernel stdlib sasl
 
 .PHONY: all deps shell xref doc eunit
-
-DEPS = enacl druuid proper
-dep_enacl = git https://github.com/jlouis/enacl.git master
-dep_druuid = git https://github.com/kellymclaughlin/druuid.git master
-dep_proper = git https://github.com/manopapad/proper.git master
 
 all: deps compile
 
@@ -49,6 +46,7 @@ dialyze: compile $(DIALYZER_PLT)
 
 shell: all
 	@$(ERL) \
+		-sname $(SNAME) \
 		-pa ./ebin -pa ./deps/*/ebin \
 		-boot start_sasl \
 		-config ./config/sys.config

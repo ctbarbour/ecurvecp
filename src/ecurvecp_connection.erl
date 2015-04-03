@@ -160,7 +160,7 @@ listen(Opts) ->
   -> {ok, socket()} | {error, closed | timeout | atom()}.
 accept(#ecurvecp_lsock{lsock=LSock}, Timeout) ->
   {ok, Pid} = start_fsm(),
-  case gen_fsm:sync_send_event(Pid, {accept, LSock, Timeout}, Timeout*2) of
+  case gen_fsm:sync_send_event(Pid, {accept, LSock, Timeout}, infinity) of
     ok ->
       {ok, #ecurvecp_socket{pid=Pid}};
     {error, Reason} ->
@@ -171,7 +171,7 @@ accept(#ecurvecp_lsock{lsock=LSock}, Timeout) ->
   -> {ok, socket()} | {error, atom()}.
 connect(Address, Port, Opts, Timeout) ->
   {ok, Pid} = start_fsm(),
-  case gen_fsm:sync_send_event(Pid, {connect, Address, Port, Opts}, Timeout) of
+  case gen_fsm:sync_send_event(Pid, {connect, Address, Port, Opts, Timeout}, infinity) of
     ok ->
       {ok, #ecurvecp_socket{pid=Pid}};
     {error, Reason} ->
@@ -201,8 +201,9 @@ init([Controller]) ->
   State = #st{controller={Controller, MRef},
               nonce_counter=0,
               received_nonce_counter=0,
-              buffer = queue:new(),
-              recv_queue = queue:new()},
+              vault=ecurvecp_vault,
+              buffer=queue:new(),
+              recv_queue=queue:new()},
   {ok, waiting, State}.
 
 -spec parse_packet(binary())
@@ -252,7 +253,7 @@ decode_hello_packet(Hello, Vault) ->
       {error, version_mismatch}
   end.
 
-verify_version(<<?MAJOR_V:64/unsigned-integer, _Minor:64/unsigned-integer>>) ->
+verify_version(<<?MAJOR_V:8/unsigned-integer, _Minor:8/unsigned-integer>>) ->
   true;
 verify_version(_Version) ->
   false.
@@ -436,24 +437,28 @@ encode_msg_packet(Msg, NonceCounter, PK, SK) ->
 
 %% Server and Client States
 waiting({accept, LSock, Timeout}, From, StateData) ->
+  HandshakeTTL = 60000,
+  ConnectionTTL = 360000,
   case gen_tcp:accept(LSock, Timeout) of
     {ok, Socket} ->
       ok = inet:setopts(Socket, [{active, once}]),
-      {next_state, hello, StateData#st{from=From, socket=Socket}};
+      {next_state, hello, StateData#st{from=From, socket=Socket,
+                                       handshake_ttl=HandshakeTTL,
+                                       connection_ttl=ConnectionTTL},
+       HandshakeTTL};
     {error, _Reason} = Error ->
       {stop, normal, Error, StateData}
   end;
-waiting({connect, Address, Port, Opts}, From, StateData) ->
+waiting({connect, Address, Port, Opts, Timeout}, From, StateData) ->
   #st{nonce_counter=N} = StateData,
   DefaultOpts = [{packet, 2}, binary, {active, false}],
   TCPOpts = lists:keydelete(server_long_term_public_key, 1, DefaultOpts ++ Opts),
 
   SLP = proplists:get_value(server_long_term_public_key, Opts),
-  HandshakeTTL = ecurvecp:get_prop_or_env(handshake_ttl, Opts),
-  ConnTTL = ecurvecp:get_prop_or_env(connection_ttl, Opts),
+  HandshakeTTL = ecurvecp:get_prop_or_env(handshake_ttl, Opts, 60000),
+  ConnTTL = ecurvecp:get_prop_or_env(connection_ttl, Opts, 360000),
 
-  ok = error_logger:info_msg("SLP: ~p~n", [SLP]),
-  case gen_tcp:connect(Address, Port, TCPOpts) of
+  case gen_tcp:connect(Address, Port, TCPOpts, Timeout) of
     {ok, Socket} ->
       #{public := CSP, secret := CSS} = enacl:box_keypair(),
       Packet = encode_hello_packet(SLP, CSP, CSS, N),
@@ -466,6 +471,7 @@ waiting({connect, Address, Port, Opts}, From, StateData) ->
               nonce_counter=N+1,
               peer_long_term_public_key=SLP,
               short_term_public_key=CSP,
+              socket=Socket,
               short_term_secret_key=CSS,
               handshake_ttl=HandshakeTTL,
               connection_ttl=ConnTTL}, HandshakeTTL};
@@ -525,10 +531,10 @@ hello(#hello_packet{} = Packet, StateData) ->
            StateData#st{peer_short_term_public_key=CSP},
            Timeout};
         {error, _Reason} = Error ->
-          {stop, normal, Error, StateData}
+          {stop, Error, StateData}
       end;
-    {error, _Reason} ->
-      transition_close(StateData)
+    {error, _Reason} = Error ->
+      {stop, Error, StateData}
   end;
 hello(_Packet, StateData) ->
   transition_close(StateData).
@@ -617,8 +623,13 @@ handle_info(Info, StateName, StateData) ->
   error_logger:info_msg("Unmatched info ~p in state ~p", [Info, StateName]),
   {next_state, StateName, StateData}.
 
-terminate(_Reason, _StateName, _StateData) ->
-  ok.
+terminate(_Reason, _StateName, StateData) ->
+  #st{socket=Socket} = StateData,
+  if Socket =:= undefined ->
+      ok;
+    true ->
+      gen_tcp:close(Socket)
+  end.
 
 code_change(_OldVsn, StateName, StateData, _Extra) ->
   {ok, StateName, StateData}.
@@ -626,7 +637,6 @@ code_change(_OldVsn, StateName, StateData, _Extra) ->
 -spec handle_tcp(iodata(), atom(), state_data())
   -> {next_state, atom(), state_data()}.
 handle_tcp(Data, StateName, StateData) ->
-  
   case parse_packet(Data) of
     {ok, Packet} ->
       ?MODULE:StateName(Packet, active_once(StateData));
@@ -648,7 +658,7 @@ handle_tcp_closed(StateData) ->
 transition_close(StateData) ->
   #st{socket=Socket} = StateData,
   ok = gen_tcp:close(Socket),
-  {next_state, closed, StateData#st{socket=undefined}}.
+  {stop, normal, StateData#st{socket=undefined}}.
 
 -spec start_fsm() -> {ok, pid()}.
 start_fsm() ->
