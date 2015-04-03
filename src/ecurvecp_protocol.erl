@@ -219,8 +219,6 @@ encode_cookie_packet(Codec) ->
   Cookie = encode_cookie(CSTPK, SSTPK, MK),
   PlainText = <<SSTPK/binary, Cookie/binary>>,
   Box = enacl:box(PlainText, NonceString, CSTPK, SLTSK),
-  ok = error_logger:info_msg("[~p] CSTPK: ~p~nSLTSK: ~p~n", [self(), CSTPK, SLTSK]),
-  ok = error_logger:info_msg("[~p] Nonce: ~p~nBox: ~p~n", [self(), Nonce, Box]),
   <<?COOKIE, CE/binary, SE/binary, Nonce/binary, Box/binary>>.
 
 encode_cookie(ClientShortTermPubKey, ServerShortTermSecKey, MinuteKey) ->
@@ -270,10 +268,10 @@ verify_initiate_box_contents(<<CLTPK:32/binary, Vouch:64/binary,
   Codec#codec{client_long_term_public_key=CLTPK}.
 
 verify_vouch(CLTPK, <<Nonce:16/binary, Box:48/binary>>, Codec) ->
-  #codec{server_long_term_secret_key=SLTPK,
+  #codec{server_long_term_secret_key=SLTSK,
          client_short_term_public_key=CSTPK} = Codec,
   NonceString = ecurvecp_nonces:nonce_string(vouch, Nonce),
-  {ok, VouchedCSTPK} = enacl:box_open(Box, NonceString, CLTPK, SLTPK),
+  {ok, VouchedCSTPK} = enacl:box_open(Box, NonceString, CLTPK, SLTSK),
   enacl:verify_32(VouchedCSTPK, CSTPK).
 
 verify_client(_CLTPK, _Codec) ->

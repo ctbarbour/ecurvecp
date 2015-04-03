@@ -3,6 +3,7 @@
 -define(TAB, ?MODULE).
 
 -export([short_term_nonce/1, long_term_nonce_counter/1,
+         long_term_nonce/0,
          long_term_nonce_timestamp/0, nonce_string/2]).
 
 short_term_nonce(Key) ->
@@ -17,6 +18,9 @@ short_term_nonce(Key) ->
     [] ->
       F(1)
   end.
+
+long_term_nonce() ->
+  enacl:randombytes(16).
 
 long_term_nonce_counter(Key) ->
   I = erlang:phash2(Key),

@@ -43,3 +43,12 @@
     nonce,
     box
   }).
+
+-type hello_packet()      :: #hello_packet{}.
+-type cookie_packet()     :: #cookie_packet{}.
+-type initiate_packet()   :: #initiate_packet{}.
+-type client_msg_packet() :: #client_msg_packet{}.
+-type server_msg_packet() :: #server_msg_packet{}.
+
+-type key() :: <<_:32>>.
+-type extension() :: <<_:16>>.

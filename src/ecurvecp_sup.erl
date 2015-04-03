@@ -8,14 +8,17 @@ start_link() ->
   supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 init([]) ->
-  ecurvecp_nonces = ets:new(ecurvecp_nonces, [named_table, public, set]),
+  LongTermKeypair = application:get_env(ecurvecp, long_term_key_pair, enacl:box_keypair()),
+  ConnSup = {ecurvecp_connection_sup,
+             {ecurvecp_connection_sup, start_link, []},
+             permanent, 5000, supervisor, [ecurvecp_connection_sup]},
 
-  ServerSup = {ecurvecp_server_sup,
-               {ecurvecp_server_sup, start_link, []},
-               permanent, 5000, supervisor, [ecurvecp_server_sup]},
+  Cookie = {ecurvecp_cookie,
+            {ecurvecp_cookie, start_link, []},
+            permanent, 5000, worker, [ecurvecp_cookie]},
 
-  ClientSup = {ecurvecp_client_sup,
-               {ecurvecp_client_sup, start_link, []},
-               permanent, 5000, supervisor, [ecurvecp_client_sup]},
+  Vault = {ecurvecp_vault,
+           {ecurvecp_vault, start_link, [LongTermKeypair]},
+           permanent, 5000, worker, [ecurvecp_vault]},
 
-  {ok, {{one_for_one, 10, 10}, [ServerSup, ClientSup]}}.
+  {ok, {{one_for_one, 10, 10}, [Vault, Cookie, ConnSup]}}.

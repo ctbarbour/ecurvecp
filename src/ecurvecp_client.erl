@@ -212,7 +212,7 @@ encode_initiate_packet(Codec) ->
          cookie=Cookie} = Codec,
   Vouch = encode_vouch(Codec),
   DomainName = encode_domain_name(),
-  PlainText = <<CLTPK/binary, Vouch/binary, DomainName/binary, "CurveCPI">>,
+  PlainText = <<CLTPK/binary, Vouch/binary, DomainName/binary, (binary:copy(<<0>>, 16))/binary>>,
   Nonce = ecurvecp_nonces:short_term_nonce(CSTSK),
   NonceString = ecurvecp_nonces:nonce_string(initiate, Nonce),
   Box = enacl:box(PlainText, NonceString, SSTPK, CSTSK),
