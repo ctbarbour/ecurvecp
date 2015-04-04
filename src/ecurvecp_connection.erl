@@ -5,13 +5,22 @@
 -define(WELCOME, "RL3aNMXK").
 -define(INITIATE, "QvnQ5XlI").
 -define(READY, "RL3aNMXR").
--define(SERVER_M, "RL3aNMXM").
--define(CLIENT_M, "QvnQ5XlM").
+-define(MESSAGE, "RL3aNMXM").
 -define(ERROR, "ERROR---").
 
 -define(MAJOR_V, 1).
 -define(MINOR_V, 0).
 -define(VERSION, <<?MAJOR_V:8/unsigned-integer, ?MINOR_V:8/unsigned-integer>>).
+
+-export([name/0]).
+-export([secure/0]).
+-export([messages/0]).
+-export([accept_ack/2]).
+-export([connect/3]).
+-export([setopts/2]).
+-export([peername/1]).
+-export([sockname/1]).
+-export([shutdown/2]).
 
 -export([start_link/1,
          listen/1,
@@ -52,7 +61,8 @@
 -export([decode_initiate_packet/3]).
 -export([encode_ready_packet/3]).
 -export([decode_ready_packet/3]).
--export([encode_msg_packet/4]).
+-export([encode_msg_packet/5]).
+-export([decode_msg_packet/4]).
 
 -record(hello_packet, {
     version,
@@ -62,7 +72,6 @@
   }).
 
 -record(welcome_packet, {
-    cookie,
     nonce,
     box
   }).
@@ -78,12 +87,7 @@
     nonce
   }).
 
--record(server_msg_packet, {
-    nonce,
-    box
-  }).
-
--record(client_msg_packet, {
+-record(msg_packet, {
     nonce,
     box
   }).
@@ -117,24 +121,55 @@
     received_nonce_counter        :: non_neg_integer(),
     buffer                        :: queue:queue(iodata()),
     recv_queue                    :: queue:queue(pid()),
-    negotiated_version            :: pos_integer()
+    negotiated_version            :: pos_integer(),
+    active                        :: boolean() | once,
+    side                          :: client | server
   }).
 
 -type from()              :: {pid(), reference()}.
--type key()               :: <<_:32>>.
+-type key()               :: <<_:256>>.
 -type lsock()             :: #ecurvecp_lsock{}.
--type asock()             :: #ecurvecp_socket{}.
--type socket()            :: lsock() | asock().
+-type csock()             :: #ecurvecp_socket{}.
+-type socket()            :: lsock() | csock().
 -type opts()              :: [atom() | {atom(), term()}].
 -type address()           :: inet:ip_address() | inet:hostname().
--type state_data()        :: #st{}.
 -type hello_packet()      :: #hello_packet{}.
--type welcome_packet()     :: #welcome_packet{}.
+-type welcome_packet()    :: #welcome_packet{}.
 -type initiate_packet()   :: #initiate_packet{}.
--type client_msg_packet() :: #client_msg_packet{}.
--type server_msg_packet() :: #server_msg_packet{}.
--type ecurvecp_packet()   :: hello_packet() | welcome_packet() | initiate_packet()
-  | client_msg_packet() | server_msg_packet().
+-type msg_packet()        :: #msg_packet{}.
+-type ready_packet()      :: #ready_packet{}.
+-type ecurvecp_packet()   :: hello_packet() | welcome_packet()
+  | initiate_packet() | ready_packet() | msg_packet().
+
+name() ->
+  ecurvecp.
+
+secure() ->
+  true.
+
+messages() ->
+  {ecurvecp, ecurvecp_closed, ecurvecp_error}.
+
+accept_ack(_Socket, _Timeout) ->
+  ok.
+
+setopts(Socket, Opts) ->
+  #ecurvecp_socket{pid=Pid} = Socket,
+  gen_fsm:sync_send_all_state_event(Pid, {setopts, Opts}).
+
+peername(#ecurvecp_lsock{lsock=Socket}) ->
+  inet:peername(Socket);
+peername(#ecurvecp_socket{pid=Pid}) ->
+  gen_fsm:sync_send_all_state_event(Pid, peername).
+
+sockname(#ecurvecp_lsock{lsock=Socket}) ->
+  inet:sockname(Socket);
+sockname(#ecurvecp_socket{pid=Pid}) ->
+  gen_fsm:sync_send_all_state_event(Pid, sockname).
+
+shutdown(Socket, How) ->
+  #ecurvecp_socket{pid=Pid} = Socket,
+  gen_fsm:sync_send_all_state_event(Pid, {shutdown, How}).
 
 start_link(Controller) ->
   gen_fsm:start_link(?MODULE, [Controller], []).
@@ -167,11 +202,17 @@ accept(#ecurvecp_lsock{lsock=LSock}, Timeout) ->
       {error, Reason}
   end.
 
+-spec connect(address(), inet:port_number(), opts())
+  -> {ok, csock()} | {error, atom()}.
+connect(Address, Port, Opts) ->
+  connect(Address, Port, Opts, infinity).
+
 -spec connect(address(), inet:port_number(), opts(), timeout())
   -> {ok, socket()} | {error, atom()}.
 connect(Address, Port, Opts, Timeout) ->
   {ok, Pid} = start_fsm(),
-  case gen_fsm:sync_send_event(Pid, {connect, Address, Port, Opts, Timeout}, infinity) of
+  Options = [{handshake_ttl, Timeout} | Opts],
+  case gen_fsm:sync_send_event(Pid, {connect, Address, Port, Options}, infinity) of
     ok ->
       {ok, #ecurvecp_socket{pid=Pid}};
     {error, Reason} ->
@@ -180,12 +221,26 @@ connect(Address, Port, Opts, Timeout) ->
 
 -spec send(socket(), iodata()) -> ok | {error, atom()}.
 send(#ecurvecp_socket{pid=Pid}, Packet) ->
-  gen_fsm:sync_send_event(Pid, Packet).
+  case catch(gen_fsm:sync_send_event(Pid, {send, Packet})) of
+    ok ->
+      ok;
+    {error, Reason} ->
+      {error, Reason};
+    {'EXIT', {noproc, _}} ->
+      {error, closed}
+  end.
 
 -spec recv(socket(), timeout())
   -> {ok, term()} | {error, closed | timeout | atom()}.
 recv(#ecurvecp_socket{pid=Pid}, Timeout) ->
-  gen_fsm:sync_send_event(Pid, recv, Timeout).
+  try
+    gen_fsm:sync_send_event(Pid, recv, Timeout)
+  catch
+    exit:{noproc, _} ->
+      {error, closed};
+    exit:{timeout, _} ->
+      {error, timeout}
+  end.
 
 -spec close(socket()) -> ok | {error, atom()}.
 close(#ecurvecp_socket{pid=Pid}) ->
@@ -203,6 +258,7 @@ init([Controller]) ->
               received_nonce_counter=0,
               vault=ecurvecp_vault,
               buffer=queue:new(),
+              active=false,
               recv_queue=queue:new()},
   {ok, waiting, State}.
 
@@ -222,10 +278,8 @@ parse_packet(<<?WELCOME, Nonce:16/binary, Box:144/binary>>) ->
   {ok, #welcome_packet{nonce=Nonce, box=Box}};
 parse_packet(<<?READY, Nonce:8/binary, Box/binary>>) ->
   {ok, #ready_packet{nonce=Nonce, box=Box}};
-parse_packet(<<?CLIENT_M, Nonce:8/binary, Box/binary>>) ->
-  {ok, #client_msg_packet{nonce=Nonce, box=Box}};
-parse_packet(<<?SERVER_M, Nonce:8/binary, Box/binary>>) ->
-  {ok, #server_msg_packet{nonce=Nonce, box=Box}};
+parse_packet(<<?MESSAGE, Nonce:8/binary, Box/binary>>) ->
+  {ok, #msg_packet{nonce=Nonce, box=Box}};
 parse_packet(<<?ERROR, Reason/binary>>) ->
   {ok, #error_packet{reason=Reason}};
 parse_packet(_) ->
@@ -277,7 +331,10 @@ verify_hello_box_contents(_Contents) ->
 %% - server long nonce (16 octets) implicitly prefixed with 8 octets to form 24 octet nonce
 %% - box (144 octets) that encrypts the server short-term public key (SSP) (32 octets)
 %%    and the server cookie (K) (96 octets), from the server long-term public key (SLP) (32 octets) to
-%%    the client short-term public key (CSP) (32 octets) Box[S', K](S -> C')
+%%    the client short-term public key (CSP) (32 octets)
+%%    Box[S', K](S -> C')
+%%    - Create the box using client short-term public key and the server long-term secret key
+%%    - Open the box using the server long-term public key and the client short-term secret key
 encode_welcome_packet(CSP, SSP, SSS, Vault) ->
   Nonce = enacl:randombytes(16),
   NonceString = nonce_string(welcome, Nonce),
@@ -323,8 +380,8 @@ decode_welcome_box_contents(_Contents) ->
 %%  client short-term public key (CSP) to the servers short-term public key (SSP)
 %%  Box[C, V](C', S')
 encode_initiate_packet(Cookie, SSP, SLP, Vault, CSP, CSS, NonceCounter) ->
-  Vouch = encode_vouch(CSP, SLP, SSP, Vault),
   CLP = Vault:public_key(),
+  Vouch = encode_vouch(CSP, SLP, SSP, Vault),
   Metadata = binary:copy(<<0>>, 64),
   PlainText = <<CLP/binary, Vouch/binary, Metadata/binary>>,
   Nonce = <<NonceCounter:64/unsigned-little-integer>>,
@@ -336,7 +393,10 @@ encode_initiate_packet(Cookie, SSP, SLP, Vault, CSP, CSS, NonceCounter) ->
 %%  - client long nonce (16 octets) implicitly prefixed with 8 octets to form 24 octet nonce
 %%  - vouch box (80 octets) that encrypts the client short-term public key (CSP) (32 octets)
 %%    and the server long-term public key (SLP) from the client long-term public key (CLP) to
-%%    the server short-term public key (SSP). Box[C', S](C -> S')
+%%    the server short-term public key (SSP).
+%%    Box[C', S](C -> S')
+%%    - Create using server short-term public key and client long-term secret key
+%%    - Open using client long-term public key and server short-term secret key
 encode_vouch(CSP, SLP, SSP, Vault) ->
   Nonce = enacl:randombytes(16),
   NonceString = nonce_string(vouch, Nonce),
@@ -389,7 +449,7 @@ minute_key_cookie_verify(NonceString, Box, CSP, [Curr|Prev]) ->
 verify_initiate_box(Nonce, Box, CSP, SSS, Vault) ->
   NonceString = nonce_string(initiate, Nonce),
   case enacl:box_open(Box, NonceString, CSP, SSS) of
-    {ok, <<CLP:32/binary, VouchNonce:16/binary, VouchBox:80/binary>>} ->
+    {ok, <<CLP:32/binary, VouchNonce:16/binary, VouchBox:80/binary, _Metadata/binary>>} ->
       SLP = Vault:public_key(),
       verify_vouch(CLP, CSP, VouchNonce, VouchBox, SLP, SSS);
     {error, failed_verification} ->
@@ -400,7 +460,8 @@ verify_initiate_box(Nonce, Box, CSP, SSS, Vault) ->
 %% is identical the one received in the initiate box. Further verify that the boxed
 %% server long-term public key is identical to the one in the vault.
 verify_vouch(CLP, CSP, Nonce, Box, SLP, SSS) ->
-  case enacl:box_open(Box, Nonce, CLP, SSS) of
+  NonceString = nonce_string(vouch, Nonce),
+  case enacl:box_open(Box, NonceString, CLP, SSS) of
     {ok, <<BoxedCSP:32/binary, BoxedSLP:32/binary>>} ->
       enacl:verify_32(BoxedCSP, CSP) andalso enacl:verify_32(BoxedSLP, SLP);
     {error, failed_verification} ->
@@ -429,11 +490,24 @@ decode_ready_packet(Packet, SSP, CSS) ->
       {error, invalid_ready_box}
   end.
 
-encode_msg_packet(Msg, NonceCounter, PK, SK) ->
+%% Box[M](C' -> S')
+%% Message data encoded from the sender's short-term key to receiver's
+%% short-term key
+encode_msg_packet(Msg, Side, NonceCounter, PK, SK) ->
   Nonce = <<NonceCounter:64/unsigned-little-integer>>,
-  NonceString = nonce_string(server, Nonce),
+  NonceString = nonce_string(Side, Nonce),
   Box = enacl:box(Msg, NonceString, PK, SK),
-  <<?SERVER_M, Nonce/binary, Box/binary>>.
+  <<?MESSAGE, Nonce/binary, Box/binary>>.
+
+decode_msg_packet(Packet, Side, PK, SK) ->
+  #msg_packet{nonce=Nonce, box=Box} = Packet,
+  NonceString = case Side of
+    server ->
+      nonce_string(client, Nonce);
+    client ->
+      nonce_string(server, Nonce)
+  end,
+  enacl:box_open(Box, NonceString, PK, SK).
 
 %% Server and Client States
 waiting({accept, LSock, Timeout}, From, StateData) ->
@@ -444,35 +518,39 @@ waiting({accept, LSock, Timeout}, From, StateData) ->
       ok = inet:setopts(Socket, [{active, once}]),
       {next_state, hello, StateData#st{from=From, socket=Socket,
                                        handshake_ttl=HandshakeTTL,
+                                       side=server,
                                        connection_ttl=ConnectionTTL},
        HandshakeTTL};
     {error, _Reason} = Error ->
       {stop, normal, Error, StateData}
   end;
-waiting({connect, Address, Port, Opts, Timeout}, From, StateData) ->
+waiting({connect, Address, Port, Opts}, From, StateData) ->
   #st{nonce_counter=N} = StateData,
   DefaultOpts = [{packet, 2}, binary, {active, false}],
-  TCPOpts = lists:keydelete(server_long_term_public_key, 1, DefaultOpts ++ Opts),
+  TCPOpts = lists:foldl(fun(A, O) ->
+          lists:keydelete(A, 1, O)
+      end, DefaultOpts ++ Opts, [server_long_term_public_key, handshake_ttl]),
 
   SLP = proplists:get_value(server_long_term_public_key, Opts),
   HandshakeTTL = ecurvecp:get_prop_or_env(handshake_ttl, Opts, 60000),
   ConnTTL = ecurvecp:get_prop_or_env(connection_ttl, Opts, 360000),
 
-  case gen_tcp:connect(Address, Port, TCPOpts, Timeout) of
+  case gen_tcp:connect(Address, Port, TCPOpts) of
     {ok, Socket} ->
       #{public := CSP, secret := CSS} = enacl:box_keypair(),
       Packet = encode_hello_packet(SLP, CSP, CSS, N),
       case gen_tcp:send(Socket, Packet) of
         ok ->
           ok = inet:setopts(Socket, [{active, once}]),
-          {next_state, cookie, StateData#st{
+          {next_state, welcome, StateData#st{
               from=From,
               peer={Address, Port},
               nonce_counter=N+1,
               peer_long_term_public_key=SLP,
               short_term_public_key=CSP,
-              socket=Socket,
               short_term_secret_key=CSS,
+              socket=Socket,
+              side=client,
               handshake_ttl=HandshakeTTL,
               connection_ttl=ConnTTL}, HandshakeTTL};
         {error, Reason} ->
@@ -486,20 +564,37 @@ waiting(Msg, _From, State) ->
   {stop, normal, badmatch, State}.
 
 %% From internal tcp socket
-established(#client_msg_packet{}, StateData) ->
-  #st{received_nonce_counter=RN} = StateData,
-  {next_state, established, StateData#st{received_nonce_counter=RN+1}};
-established(#server_msg_packet{}, StateData) ->
-  #st{received_nonce_counter=RN} = StateData,
-  {next_state, established, StateData#st{received_nonce_counter=RN+1}};
+established(#msg_packet{} = Packet, StateData) ->
+  #st{peer_short_term_public_key=PK, short_term_secret_key=SK,
+      received_nonce_counter=RC, active=Active,
+      controller={Controller, _}, side=Side} = StateData,
+  case decode_msg_packet(Packet, Side, PK, SK) of
+    {ok, Contents} ->
+      case Active of
+        once ->
+          Controller ! {ecurvecp, #ecurvecp_socket{pid=self()}, Contents},
+          process_recv_queue(StateData#st{buffer=Contents, active=false, received_nonce_counter=RC+1});
+        true ->
+          Controller ! {ecurvecp, #ecurvecp_socket{pid=self()}, Contents},
+          process_recv_queue(StateData#st{buffer=Contents, received_nonce_counter=RC+1});
+        false ->
+          process_recv_queue(StateData#st{buffer=Contents, received_nonce_counter=RC+1})
+      end;
+    {error, _Reason} = Error ->
+      {stop, Error, StateData}
+  end;
 established(_Packet, StateData) ->
   transition_close(StateData).
 
 %% From public API
 established({send, Msg}, _From, StateData) ->
   #st{socket=Socket, peer_short_term_public_key=PK,
-     short_term_secret_key=SK, nonce_counter=N} = StateData,
-  Packet = encode_msg_packet(Msg, N, PK, SK),
+     short_term_secret_key=SK, nonce_counter=N,
+     side=Side} = StateData,
+  %% Box[M](C' -> S')
+  %% server short-term public key, client short-term secret-key
+  %% open with client short-term public key, server short-term secret key
+  Packet = encode_msg_packet(Msg, Side, N, PK, SK),
   case gen_tcp:send(Socket, Packet) of
     ok ->
       {reply, ok, established, StateData#st{nonce_counter=N+1}};
@@ -520,15 +615,17 @@ established(Event, _From, StateData) ->
 
 %% Server States
 hello(#hello_packet{} = Packet, StateData) ->
-  #st{handshake_ttl=Timeout, socket=Socket, vault=Vault} = StateData,
+  #st{handshake_ttl=Timeout, socket=Socket, vault=Vault, received_nonce_counter=RN} = StateData,
   case decode_hello_packet(Packet, Vault) of
     {ok, CSP} ->
       #{public := SSP, secret := SSS} = enacl:box_keypair(),
       WelcomePacket = encode_welcome_packet(CSP, SSP, SSS, Vault),
       case gen_tcp:send(Socket, WelcomePacket) of
         ok ->
+          ok = inet:setopts(Socket, [{active, once}]),
           {next_state, initiate,
-           StateData#st{peer_short_term_public_key=CSP},
+           StateData#st{peer_short_term_public_key=CSP,
+                        received_nonce_counter=RN+1},
            Timeout};
         {error, _Reason} = Error ->
           {stop, Error, StateData}
@@ -542,13 +639,16 @@ hello(_Packet, StateData) ->
 initiate(#initiate_packet{} = Packet, StateData) ->
   #st{socket=Socket, peer_short_term_public_key=CSP,
       connection_ttl=Timeout, vault=Vault,
-      nonce_counter=N} = StateData,
+      nonce_counter=N, received_nonce_counter=RN, from=From} = StateData,
   case decode_initiate_packet(Packet, CSP, Vault) of
     {ok, CLP, SSS} ->
       ReadyPacket = encode_ready_packet(N, CSP, SSS),
       case gen_tcp:send(Socket, ReadyPacket) of
         ok ->
+          _ = gen_fsm:reply(From, ok),
           {next_state, established, StateData#st{nonce_counter=N+1,
+                                                 received_nonce_counter=RN+1,
+                                                 from=undefined,
                                                  short_term_secret_key=SSS,
                                                  peer_long_term_public_key=CLP}, Timeout};
         {error, _Reason} ->
@@ -572,6 +672,7 @@ welcome(#welcome_packet{} = Packet, StateData) ->
       InitiatePacket = encode_initiate_packet(Cookie, SSP, SLP, Vault, CSP, CSS, N),
       case gen_tcp:send(Socket, InitiatePacket) of
         ok ->
+          ok = inet:setopts(Socket, [{active, once}]),
           {next_state, ready,
            StateData#st{peer_short_term_public_key=SSP, nonce_counter=N+1},
            HandshakeTTL};
@@ -588,12 +689,15 @@ welcome(_Packet, StateData) ->
 
 ready(#ready_packet{} = Packet, StateData) ->
   #st{from=From, connection_ttl=Timeout,
-      peer_short_term_public_key=SSPK,
-      short_term_secret_key=CSSK} = StateData,
-  case decode_ready_packet(Packet, SSPK, CSSK) of
+      received_nonce_counter=RN,
+      peer_short_term_public_key=SSP,
+      short_term_secret_key=CSS} = StateData,
+  case decode_ready_packet(Packet, SSP, CSS) of
     {ok, _Metadata} ->
-      gen_fsm:reply(From, ok),
-      {next_state, established, StateData, Timeout};
+      _ = gen_fsm:reply(From, ok),
+      {next_state, established,
+       StateData#st{from=undefined, received_nonce_counter=RN+1},
+       Timeout};
     {error, _Error} ->
       transition_close(StateData)
   end;
@@ -609,6 +713,27 @@ handle_sync_event({controlling_process, Controller}, {PrevController, _}, StateN
   true = erlang:demonitor(MRef, [flush]),
   NewRef = erlang:monitor(process, Controller),
   {reply, ok, StateName, StateData#st{controller={Controller, NewRef}}};
+handle_sync_event({controlling_process, _Controller}, _From, StateName, StateData) ->
+  {reply, {error, not_owner}, StateName, StateData};
+handle_sync_event(peername, _From, StateName, StateData) ->
+  #st{socket=Socket} = StateData,
+  {reply, inet:peername(Socket), StateName, StateData};
+handle_sync_event(sockname, _From, StateName, StateData) ->
+  #st{socket=Socket} = StateData,
+  {reply, inet:sockname(Socket), StateName, StateData};
+handle_sync_event({shutdown, How}, _From, StateName, StateData) ->
+  #st{socket=Socket} = StateData,
+  {reply, gen_tcp:shutdown(Socket, How), StateName, StateData};
+handle_sync_event({setopts, Opts}, _From, StateName, StateData) ->
+  #st{socket=Socket} = StateData,
+  case lists:keyfind(active, 1, Opts) of
+    {active, Active} ->
+      ok = inet:setopts(Socket, Opts),
+      {reply, ok, StateName, StateData#st{active=Active}};
+    false ->
+      ok = inet:setopts(Socket, Opts),
+      {reply, ok, StateName, StateData}
+  end;
 handle_sync_event(Event, _From, StateName, StateData) ->
   error_logger:info_msg("Unmatched sync_event ~p in state ~p", [Event, StateName]),
   {next_state, StateName, StateData}.
@@ -634,36 +759,51 @@ terminate(_Reason, _StateName, StateData) ->
 code_change(_OldVsn, StateName, StateData, _Extra) ->
   {ok, StateName, StateData}.
 
--spec handle_tcp(iodata(), atom(), state_data())
-  -> {next_state, atom(), state_data()}.
 handle_tcp(Data, StateName, StateData) ->
   case parse_packet(Data) of
     {ok, Packet} ->
-      ?MODULE:StateName(Packet, active_once(StateData));
+      case verify_nonce_count(Packet, StateData) of
+        true ->
+          ?MODULE:StateName(Packet, StateData);
+        false ->
+          transition_close(StateData)
+      end;
     {error, _Reason} ->
       transition_close(StateData)
   end.
 
--spec active_once(state_data()) -> state_data().
-active_once(StateData) ->
-  #st{socket=Socket} = StateData,
-  ok = inet:setopts(Socket, [{active, once}]),
-  StateData.
-
--spec handle_tcp_closed(state_data()) -> {next_state, closed, state_data()}.
 handle_tcp_closed(StateData) ->
-  {next_state, closed, StateData#st{socket=undefined}}.
-
--spec transition_close(state_data()) -> {next_state, closed, state_data()}.
-transition_close(StateData) ->
-  #st{socket=Socket} = StateData,
-  ok = gen_tcp:close(Socket),
   {stop, normal, StateData#st{socket=undefined}}.
 
--spec start_fsm() -> {ok, pid()}.
+transition_close(StateData) ->
+  #st{socket=Socket, active=Active, controller={Controller, _}} = StateData,
+  ok = gen_tcp:close(Socket),
+  _ = [Controller ! {ecurvecp_closed, #ecurvecp_socket{pid=self()}} || Active],
+  {stop, normal, StateData#st{socket=undefined}}.
+
 start_fsm() ->
   Controller = self(),
   ecurvecp_connection_sup:start_child([Controller]).
+
+process_recv_queue(StateData) ->
+  #st{recv_queue=Queue, buffer=Buffer, socket=Socket} = StateData,
+  case {queue:out(Queue), Buffer} of
+    {{{value, _Receiver}, _NewQueue}, undefined} ->
+      ok = inet:setopts(Socket, [{active, once}]),
+      {next_state, established, StateData};
+    {{{value, Receiver}, NewQueue}, Msg} ->
+      _ = gen_fsm:reply(Receiver, {ok, Msg}),
+      process_recv_queue(StateData#st{recv_queue=NewQueue, buffer=undefined});
+    {{empty, _}, _} ->
+      {next_state, established, StateData}
+  end.
+
+verify_nonce_count(#hello_packet{nonce=N}, #st{received_nonce_counter=RC}) ->
+  N > RC;
+verify_nonce_count(#initiate_packet{nonce=N}, #st{received_nonce_counter=RC}) ->
+  N > RC;
+verify_nonce_count(#msg_packet{nonce=N}, #st{received_nonce_counter=RC}) ->
+  N > RC.
 
 nonce_string(hello, <<_:8/binary>> = Nonce) ->
   <<"CurveCP-client-H", Nonce/binary>>;
@@ -673,9 +813,9 @@ nonce_string(vouch, <<_:16/binary>> = Nonce) ->
   <<"CurveCPV", Nonce/binary>>;
 nonce_string(initiate, <<_:8/binary>> = Nonce) ->
   <<"CurveCP-client-I", Nonce/binary>>;
-nonce_string(server_message, <<_:8/binary>> = Nonce) ->
+nonce_string(server, <<_:8/binary>> = Nonce) ->
   <<"CurveCP-server-M", Nonce/binary>>;
-nonce_string(client_message, <<_:8/binary>> = Nonce) ->
+nonce_string(client, <<_:8/binary>> = Nonce) ->
   <<"CurveCP-client-M", Nonce/binary>>;
 nonce_string(minute_key, <<_:16/binary>> = Nonce) ->
   <<"minute-k", Nonce/binary>>;
