@@ -788,10 +788,22 @@ handle_tcp_closed(StateData) ->
   {stop, normal, StateData#st{socket=undefined}}.
 
 transition_close(StateData) ->
-  #st{socket=Socket, active=Active, controller={Controller, _}} = StateData,
+  #st{socket=Socket, active=Active, controller={Controller, _}, from=From} = StateData,
   ok = gen_tcp:close(Socket),
-  _ = [Controller ! {ecurvecp_closed, #ecurvecp_socket{pid=self()}} || Active],
-  {stop, normal, StateData#st{socket=undefined}}.
+  ok = case Active of
+    A when A == true; A == once ->
+      Controller ! {ecurvecp_closed, #ecurvecp_socket{pid=self()}},
+      ok;
+    false ->
+      ok
+  end,
+  ok = if From /= undefined ->
+      _ = gen_fsm:reply(From, {error, closed}),
+      ok;
+    true ->
+      ok
+  end,
+  {next_state, closed, StateData#st{socket=undefined, from=undefined}}.
 
 start_fsm() ->
   Controller = self(),

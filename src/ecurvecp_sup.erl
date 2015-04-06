@@ -8,7 +8,7 @@ start_link() ->
   supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 init([]) ->
-  LongTermKeypair = application:get_env(ecurvecp, long_term_key_pair, enacl:box_keypair()),
+  LongTermKeypair = application:get_env(ecurvecp, long_term_keypair, enacl:box_keypair()),
 
   ConnSup = {ecurvecp_connection_sup,
              {ecurvecp_connection_sup, start_link, []},
