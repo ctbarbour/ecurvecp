@@ -10,29 +10,28 @@
 
 -define(MAJOR_V, 1).
 -define(MINOR_V, 0).
--define(VERSION, <<?MAJOR_V:8/unsigned-integer, ?MINOR_V:8/unsigned-integer>>).
+-define(VERSION, <<?MAJOR_V/integer, ?MINOR_V/integer>>).
+-define(COUNT_LIMIT, 18446744073709551616 - 1).
 
--export([name/0]).
--export([secure/0]).
--export([messages/0]).
--export([accept_ack/2]).
--export([connect/3]).
--export([setopts/2]).
--export([peername/1]).
--export([sockname/1]).
--export([shutdown/2]).
-
--export([start_link/1,
-         listen/1,
+-export([name/0,
+         secure/0,
+         messages/0,
          accept/2,
-         connect/4,
-         recv/2,
+         accept_ack/2,
+         listen/1,
+         connect/3, connect/4,
+         recv/2, recv/3,
          send/2,
          controlling_process/2,
-         close/1
-        ]).
+         close/1,
+         shutdown/2,
+         setopts/2,
+         peername/1,
+         sockname/1
+      ]).
 
--export([init/1,
+-export([start_link/1,
+         init/1,
          handle_event/3,
          handle_sync_event/4,
          handle_info/3,
@@ -61,8 +60,8 @@
 -export([decode_initiate_packet/3]).
 -export([encode_ready_packet/3]).
 -export([decode_ready_packet/3]).
--export([encode_msg_packet/5]).
--export([decode_msg_packet/4]).
+-export([encode_msg_packet/4]).
+-export([decode_msg_packet/3]).
 
 -record(hello_packet, {
     version,
@@ -117,9 +116,10 @@
     short_term_public_key         :: key(),
     short_term_secret_key         :: key(),
     short_term_shared_key         :: key(),
+    shared_key                    :: key(),
     nonce_counter                 :: non_neg_integer(),
     received_nonce_counter        :: non_neg_integer(),
-    buffer                        :: queue:queue(iodata()),
+    buffer                        :: iodata(),
     recv_queue                    :: queue:queue(pid()),
     negotiated_version            :: pos_integer(),
     active                        :: boolean() | once,
@@ -230,6 +230,9 @@ send(#ecurvecp_socket{pid=Pid}, Packet) ->
       {error, closed}
   end.
 
+recv(Socket, _Length, Timeout) ->
+  recv(Socket, Timeout).
+
 -spec recv(socket(), timeout())
   -> {ok, term()} | {error, closed | timeout | atom()}.
 recv(#ecurvecp_socket{pid=Pid}, Timeout) ->
@@ -254,10 +257,9 @@ controlling_process(#ecurvecp_socket{pid=Pid}, Controller) ->
 init([Controller]) ->
   MRef = erlang:monitor(process, Controller),
   State = #st{controller={Controller, MRef},
-              nonce_counter=0,
+              nonce_counter=1,
               received_nonce_counter=0,
               vault=ecurvecp_vault,
-              buffer=queue:new(),
               active=false,
               recv_queue=queue:new()},
   {ok, waiting, State}.
@@ -293,24 +295,26 @@ encode_hello_packet(SLP, CSP, CSS, NonceCounter) ->
   <<?HELLO, ?VERSION/binary, Z/binary, CSP/binary, Nonce/binary, Box/binary>>.
 
 decode_hello_packet(Hello, Vault) ->
-  #hello_packet{nonce=Nonce, box=Box, version=Version,
+  #hello_packet{nonce=Nonce, box=Box, version=V,
                 client_short_term_public_key=CSP} = Hello,
-  case verify_version(Version) of
-    true ->
+  case verify_version(V) of
+    {ok, Version} ->
       case verify_hello_packet_box(Nonce, Box, CSP, Vault) of
         true ->
-          {ok, CSP};
+          {ok, CSP, Version};
         false ->
           {error, invalid_hello_box}
       end;
-    false ->
-      {error, version_mismatch}
+    Error ->
+      Error
   end.
 
-verify_version(<<?MAJOR_V:8/unsigned-integer, _Minor:8/unsigned-integer>>) ->
-  true;
+verify_version(<<?MAJOR_V/integer, Minor/integer>>) ->
+  {ok, {?MAJOR_V, Minor}};
+verify_version(<<Major/integer, Minor/integer>>) ->
+  {error, {version_mismatch, {Major, Minor}}};
 verify_version(_Version) ->
-  false.
+  {error, invalid_version_format}.
 
 verify_hello_packet_box(Nonce, Box, CSP, Vault) ->
   NonceString = nonce_string(hello, Nonce),
@@ -408,10 +412,10 @@ encode_vouch(CSP, SLP, SSP, Vault) ->
 decode_initiate_packet(Packet, CSP, Vault) ->
   #initiate_packet{cookie=Cookie, nonce=Nonce, box=Box} = Packet,
   case verify_cookie(Cookie, CSP) of
-    {ok, CSP, SSS} ->
+    {ok, SSS} ->
       case verify_initiate_box(Nonce, Box, CSP, SSS, Vault) of
         true ->
-          {ok, CSP, SSS};
+          {ok, SSS};
         false ->
           {error, invalid_initiate_box_contents}
       end;
@@ -434,16 +438,21 @@ minute_key_cookie_verify(_NonceString, _Box, _CSP, []) ->
   {error, invalid_cookie};
 minute_key_cookie_verify(NonceString, Box, CSP, [Curr|Prev]) ->
   case enacl:secretbox_open(Box, NonceString, Curr) of
-    {ok, <<BoxedCSP:32/binary, BoxedSSS:32/binary>>} ->
-      case enacl:verify_32(BoxedCSP, CSP) of
-        true ->
-          {ok, CSP, BoxedSSS};
-        false ->
-          {error, invalid_cookie}
-      end;
+    {ok, Contents} ->
+      verify_cookie_box_contents(Contents, CSP);
     {error, failed_verification} ->
       minute_key_cookie_verify(NonceString, Box, CSP, Prev)
   end.
+
+verify_cookie_box_contents(<<BoxedCSP:32/binary, BoxedSSS:32/binary>>, CSP) ->
+  case enacl:verify_32(BoxedCSP, CSP) of
+    true ->
+      {ok, BoxedSSS};
+    false ->
+      {error, invalid_cookie}
+  end;
+verify_cookie_box_contents(_Contents, _CSP) ->
+  {error, invalid_cookie}.
 
 %% Open Box[C, V](C' -> S') with (C',s'). Verify the contents of the vouch.
 verify_initiate_box(Nonce, Box, CSP, SSS, Vault) ->
@@ -493,13 +502,13 @@ decode_ready_packet(Packet, SSP, CSS) ->
 %% Box[M](C' -> S')
 %% Message data encoded from the sender's short-term key to receiver's
 %% short-term key
-encode_msg_packet(Msg, Side, NonceCounter, PK, SK) ->
+encode_msg_packet(Msg, Side, NonceCounter, Key) ->
   Nonce = <<NonceCounter:64/unsigned-little-integer>>,
   NonceString = nonce_string(Side, Nonce),
-  Box = enacl:box(Msg, NonceString, PK, SK),
+  Box = enacl:box_afternm(Msg, NonceString, Key),
   <<?MESSAGE, Nonce/binary, Box/binary>>.
 
-decode_msg_packet(Packet, Side, PK, SK) ->
+decode_msg_packet(Packet, Side, Key) ->
   #msg_packet{nonce=Nonce, box=Box} = Packet,
   NonceString = case Side of
     server ->
@@ -507,7 +516,7 @@ decode_msg_packet(Packet, Side, PK, SK) ->
     client ->
       nonce_string(server, Nonce)
   end,
-  enacl:box_open(Box, NonceString, PK, SK).
+  enacl:box_open_afternm(Box, NonceString, Key).
 
 %% Server and Client States
 waiting({accept, LSock, Timeout}, From, StateData) ->
@@ -515,9 +524,11 @@ waiting({accept, LSock, Timeout}, From, StateData) ->
   ConnectionTTL = 360000,
   case gen_tcp:accept(LSock, Timeout) of
     {ok, Socket} ->
+      Peer = inet:peername(Socket),
       ok = inet:setopts(Socket, [{active, once}]),
       {next_state, hello, StateData#st{from=From, socket=Socket,
                                        handshake_ttl=HandshakeTTL,
+                                       peer=Peer,
                                        side=server,
                                        connection_ttl=ConnectionTTL},
        HandshakeTTL};
@@ -529,9 +540,9 @@ waiting({connect, Address, Port, Opts}, From, StateData) ->
   DefaultOpts = [{packet, 2}, binary, {active, false}],
   TCPOpts = lists:foldl(fun(A, O) ->
           lists:keydelete(A, 1, O)
-      end, DefaultOpts ++ Opts, [server_long_term_public_key, handshake_ttl]),
+      end, DefaultOpts ++ Opts, [peer_long_term_public_key, handshake_ttl, connection_ttl]),
 
-  SLP = proplists:get_value(server_long_term_public_key, Opts),
+  SLP = proplists:get_value(peer_long_term_public_key, Opts),
   HandshakeTTL = ecurvecp:get_prop_or_env(handshake_ttl, Opts, 60000),
   ConnTTL = ecurvecp:get_prop_or_env(connection_ttl, Opts, 360000),
 
@@ -565,18 +576,18 @@ waiting(Msg, _From, State) ->
 
 %% From internal tcp socket
 established(#msg_packet{} = Packet, StateData) ->
-  #st{peer_short_term_public_key=PK, short_term_secret_key=SK,
+  #st{shared_key=Key,
       received_nonce_counter=RC, active=Active,
       controller={Controller, _}, side=Side} = StateData,
-  case decode_msg_packet(Packet, Side, PK, SK) of
+  case decode_msg_packet(Packet, Side, Key) of
     {ok, Contents} ->
       case Active of
         once ->
           Controller ! {ecurvecp, #ecurvecp_socket{pid=self()}, Contents},
-          process_recv_queue(StateData#st{buffer=Contents, active=false, received_nonce_counter=RC+1});
+          {next_state, established, StateData#st{active=false, received_nonce_counter=RC+1}};
         true ->
           Controller ! {ecurvecp, #ecurvecp_socket{pid=self()}, Contents},
-          process_recv_queue(StateData#st{buffer=Contents, received_nonce_counter=RC+1});
+          {next_state, established, StateData#st{received_nonce_counter=RC+1}};
         false ->
           process_recv_queue(StateData#st{buffer=Contents, received_nonce_counter=RC+1})
       end;
@@ -588,18 +599,14 @@ established(_Packet, StateData) ->
 
 %% From public API
 established({send, Msg}, _From, StateData) ->
-  #st{socket=Socket, peer_short_term_public_key=PK,
-     short_term_secret_key=SK, nonce_counter=N,
+  #st{socket=Socket, shared_key=Key, nonce_counter=N,
      side=Side} = StateData,
-  %% Box[M](C' -> S')
-  %% server short-term public key, client short-term secret-key
-  %% open with client short-term public key, server short-term secret key
-  Packet = encode_msg_packet(Msg, Side, N, PK, SK),
+  Packet = encode_msg_packet(Msg, Side, N, Key),
   case gen_tcp:send(Socket, Packet) of
     ok ->
       {reply, ok, established, StateData#st{nonce_counter=N+1}};
     {error, _Reason} = Error ->
-      {reply, Error, established, StateData}
+      {stop, normal, Error, StateData}
   end;
 established(recv, From, StateData) ->
   #st{socket=Socket, recv_queue=RecvQueue} = StateData,
@@ -617,7 +624,7 @@ established(Event, _From, StateData) ->
 hello(#hello_packet{} = Packet, StateData) ->
   #st{handshake_ttl=Timeout, socket=Socket, vault=Vault, received_nonce_counter=RN} = StateData,
   case decode_hello_packet(Packet, Vault) of
-    {ok, CSP} ->
+    {ok, CSP, Version} ->
       #{public := SSP, secret := SSS} = enacl:box_keypair(),
       WelcomePacket = encode_welcome_packet(CSP, SSP, SSS, Vault),
       case gen_tcp:send(Socket, WelcomePacket) of
@@ -625,6 +632,7 @@ hello(#hello_packet{} = Packet, StateData) ->
           ok = inet:setopts(Socket, [{active, once}]),
           {next_state, initiate,
            StateData#st{peer_short_term_public_key=CSP,
+                        negotiated_version=Version,
                         received_nonce_counter=RN+1},
            Timeout};
         {error, _Reason} = Error ->
@@ -641,16 +649,18 @@ initiate(#initiate_packet{} = Packet, StateData) ->
       connection_ttl=Timeout, vault=Vault,
       nonce_counter=N, received_nonce_counter=RN, from=From} = StateData,
   case decode_initiate_packet(Packet, CSP, Vault) of
-    {ok, CLP, SSS} ->
+    {ok, SSS} ->
       ReadyPacket = encode_ready_packet(N, CSP, SSS),
       case gen_tcp:send(Socket, ReadyPacket) of
         ok ->
+          SharedKey = enacl:box_beforenm(CSP, SSS),
           _ = gen_fsm:reply(From, ok),
           {next_state, established, StateData#st{nonce_counter=N+1,
                                                  received_nonce_counter=RN+1,
                                                  from=undefined,
-                                                 short_term_secret_key=SSS,
-                                                 peer_long_term_public_key=CLP}, Timeout};
+                                                 shared_key=SharedKey,
+                                                 short_term_secret_key=SSS},
+           Timeout};
         {error, _Reason} ->
           transition_close(StateData)
       end;
@@ -694,9 +704,11 @@ ready(#ready_packet{} = Packet, StateData) ->
       short_term_secret_key=CSS} = StateData,
   case decode_ready_packet(Packet, SSP, CSS) of
     {ok, _Metadata} ->
+      SharedKey = enacl:box_beforenm(SSP, CSS),
       _ = gen_fsm:reply(From, ok),
       {next_state, established,
-       StateData#st{from=undefined, received_nonce_counter=RN+1},
+       StateData#st{from=undefined, shared_key=SharedKey,
+                    received_nonce_counter=RN+1},
        Timeout};
     {error, _Error} ->
       transition_close(StateData)
@@ -799,11 +811,15 @@ process_recv_queue(StateData) ->
   end.
 
 verify_nonce_count(#hello_packet{nonce=N}, #st{received_nonce_counter=RC}) ->
-  N > RC;
+  verify_nonce_count(N, RC);
 verify_nonce_count(#initiate_packet{nonce=N}, #st{received_nonce_counter=RC}) ->
-  N > RC;
+  verify_nonce_count(N, RC);
 verify_nonce_count(#msg_packet{nonce=N}, #st{received_nonce_counter=RC}) ->
-  N > RC.
+  verify_nonce_count(N, RC);
+verify_nonce_count(<<N:64/unsigned-little-integer>>, RC) when is_integer(RC) ->
+  N > RC andalso N =< ?COUNT_LIMIT;
+verify_nonce_count(_Packet, _StateData) ->
+  true.
 
 nonce_string(hello, <<_:8/binary>> = Nonce) ->
   <<"CurveCP-client-H", Nonce/binary>>;

@@ -9,6 +9,7 @@ start_link() ->
 
 init([]) ->
   LongTermKeypair = application:get_env(ecurvecp, long_term_key_pair, enacl:box_keypair()),
+
   ConnSup = {ecurvecp_connection_sup,
              {ecurvecp_connection_sup, start_link, []},
              permanent, 5000, supervisor, [ecurvecp_connection_sup]},

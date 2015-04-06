@@ -31,6 +31,7 @@ handle_cast(_Msg, State) ->
 
 handle_info(rotate_keys, [Prev|_]) ->
   ok = erlang:send_after(60000, self(), rotate_keys),
+  ok = ecurvecp_registry:expire(),
   Current = minute_key(),
   {noreply, [Current, Prev]};
 handle_info(_Info, State) ->
