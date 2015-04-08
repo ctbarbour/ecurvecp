@@ -64,35 +64,35 @@
 -export([decode_msg_packet/3]).
 
 -record(hello_packet, {
-    version,
-    client_short_term_public_key,
-    nonce,
-    box
+    version                       :: <<_:16>>,
+    client_short_term_public_key  :: key(),
+    nonce                         :: short_nonce(),
+    box                           :: <<_:640>>
   }).
 
 -record(welcome_packet, {
-    nonce,
-    box
+    nonce :: long_nonce(),
+    box   :: <<_:1152>>
   }).
 
 -record(initiate_packet, {
-    cookie,
-    nonce,
-    box
+    cookie  :: cookie(),
+    nonce   :: short_nonce(),
+    box     :: binary()
   }).
 
 -record(ready_packet, {
-    box,
-    nonce
+    nonce :: short_nonce(),
+    box   :: binary()
   }).
 
 -record(msg_packet, {
-    nonce,
-    box
+    nonce :: short_nonce(),
+    box   :: binary()
   }).
 
 -record(error_packet, {
-    reason
+    reason  :: iodata()
   }).
 
 -record(ecurvecp_lsock, {
@@ -121,13 +121,20 @@
     received_nonce_counter        :: non_neg_integer(),
     buffer                        :: iodata(),
     recv_queue                    :: queue:queue(pid()),
-    negotiated_version            :: pos_integer(),
+    negotiated_version            :: version(),
     active                        :: boolean() | once,
-    side                          :: client | server
+    side                          :: side()
   }).
 
+-type version()           :: {pos_integer(), pos_integer()}.
 -type from()              :: {pid(), reference()}.
 -type key()               :: <<_:256>>.
+-type short_nonce()       :: <<_:64>>.
+-type long_nonce()        :: <<_:128>>.
+-type cookie()            :: <<_:768>>.
+-type nonce()             :: short_nonce() | long_nonce().
+-type nonce_key()         :: hello | welcome | initiate | ready | server
+  | client | vouch | minute_key.
 -type lsock()             :: #ecurvecp_lsock{}.
 -type csock()             :: #ecurvecp_socket{}.
 -type socket()            :: lsock() | csock().
@@ -138,39 +145,50 @@
 -type initiate_packet()   :: #initiate_packet{}.
 -type msg_packet()        :: #msg_packet{}.
 -type ready_packet()      :: #ready_packet{}.
+-type side()              :: client | server.
 -type ecurvecp_packet()   :: hello_packet() | welcome_packet()
   | initiate_packet() | ready_packet() | msg_packet().
+-type state_data()        :: #st{}.
 
+-spec name() -> atom().
 name() ->
   ecurvecp.
 
+-spec secure() -> boolean().
 secure() ->
   true.
 
+-spec messages() -> {atom(), atom(), atom()}.
 messages() ->
   {ecurvecp, ecurvecp_closed, ecurvecp_error}.
 
+-spec accept_ack(socket(), timeout()) -> ok.
 accept_ack(_Socket, _Timeout) ->
   ok.
 
+-spec setopts(socket(), opts()) -> ok.
 setopts(Socket, Opts) ->
   #ecurvecp_socket{pid=Pid} = Socket,
   gen_fsm:sync_send_all_state_event(Pid, {setopts, Opts}).
 
+-spec peername(socket()) -> {ok, {address(), inet:port_number()}}.
 peername(#ecurvecp_lsock{lsock=Socket}) ->
   inet:peername(Socket);
 peername(#ecurvecp_socket{pid=Pid}) ->
   gen_fsm:sync_send_all_state_event(Pid, peername).
 
+-spec sockname(socket()) -> {ok, {address(), inet:port_number()}}.
 sockname(#ecurvecp_lsock{lsock=Socket}) ->
   inet:sockname(Socket);
 sockname(#ecurvecp_socket{pid=Pid}) ->
   gen_fsm:sync_send_all_state_event(Pid, sockname).
 
+-spec shutdown(socket(), read | write | read_write) -> ok.
 shutdown(Socket, How) ->
   #ecurvecp_socket{pid=Pid} = Socket,
   gen_fsm:sync_send_all_state_event(Pid, {shutdown, How}).
 
+-spec start_link(pid()) -> {ok, pid()}.
 start_link(Controller) ->
   gen_fsm:start_link(?MODULE, [Controller], []).
 
@@ -230,6 +248,8 @@ send(#ecurvecp_socket{pid=Pid}, Packet) ->
       {error, closed}
   end.
 
+-spec recv(socket(), pos_integer(), timeout())
+  -> {ok, term()} | {error, closed | timeout | atom()}.
 recv(Socket, _Length, Timeout) ->
   recv(Socket, Timeout).
 
@@ -287,6 +307,7 @@ parse_packet(<<?ERROR, Reason/binary>>) ->
 parse_packet(_) ->
   {error, unmatched_packet}.
 
+-spec encode_hello_packet(key(), key(), key(), pos_integer()) -> binary().
 encode_hello_packet(SLP, CSP, CSS, NonceCounter) ->
   Z = binary:copy(<<0>>, 64),
   Nonce = <<NonceCounter:64/unsigned-little-integer>>,
@@ -294,6 +315,8 @@ encode_hello_packet(SLP, CSP, CSS, NonceCounter) ->
   Box = enacl:box(Z, NonceString, SLP, CSS),
   <<?HELLO, ?VERSION/binary, Z/binary, CSP/binary, Nonce/binary, Box/binary>>.
 
+-spec decode_hello_packet(hello_packet(), module())
+  -> {ok, key(), version()} | {error, invalid_hello_box}.
 decode_hello_packet(Hello, Vault) ->
   #hello_packet{nonce=Nonce, box=Box, version=V,
                 client_short_term_public_key=CSP} = Hello,
@@ -309,6 +332,9 @@ decode_hello_packet(Hello, Vault) ->
       Error
   end.
 
+-spec verify_version(binary())
+  -> {ok, version()}
+  | {error, {version_mismatch, version()} | invalid_version_format}.
 verify_version(<<?MAJOR_V/integer, Minor/integer>>) ->
   {ok, {?MAJOR_V, Minor}};
 verify_version(<<Major/integer, Minor/integer>>) ->
@@ -316,6 +342,8 @@ verify_version(<<Major/integer, Minor/integer>>) ->
 verify_version(_Version) ->
   {error, invalid_version_format}.
 
+-spec verify_hello_packet_box(short_nonce(), binary(), key(), module())
+  -> boolean().
 verify_hello_packet_box(Nonce, Box, CSP, Vault) ->
   NonceString = nonce_string(hello, Nonce),
   case Vault:box_open(Box, NonceString, CSP) of
@@ -325,6 +353,7 @@ verify_hello_packet_box(Nonce, Box, CSP, Vault) ->
       false
   end.
 
+-spec verify_hello_box_contents(binary()) -> boolean().
 verify_hello_box_contents(<<First:32/binary, Second:32/binary>>) ->
   Zeros = binary:copy(<<0>>, 32),
   enacl:verify_32(First, Zeros) andalso enacl:verify_32(Second, Zeros);
@@ -339,6 +368,7 @@ verify_hello_box_contents(_Contents) ->
 %%    Box[S', K](S -> C')
 %%    - Create the box using client short-term public key and the server long-term secret key
 %%    - Open the box using the server long-term public key and the client short-term secret key
+-spec encode_welcome_packet(key(), key(), key(), module()) -> binary().
 encode_welcome_packet(CSP, SSP, SSS, Vault) ->
   Nonce = enacl:randombytes(16),
   NonceString = nonce_string(welcome, Nonce),
@@ -352,6 +382,7 @@ encode_welcome_packet(CSP, SSP, SSS, Vault) ->
 %%  - box (80 octets) containing client short-term public key (CSP) (32 octets) and the
 %%    server short-term secret key (SSS) (32 octets) encrypted to and from a secret short-term
 %%    "cookie key". Box[C', s'](t)
+-spec encode_cookie(key(), key()) -> cookie().
 encode_cookie(CSP, SSS) ->
   MinuteKey = ecurvecp_cookie:current_key(),
   PlainText = <<CSP/binary, SSS/binary>>,
@@ -361,6 +392,9 @@ encode_cookie(CSP, SSS) ->
   <<Nonce/binary, Box/binary>>.
 
 %% Opens Box[S', K](S -> C') with (S, c')
+-spec decode_welcome_packet(welcome_packet(), key(), key())
+  -> {ok, key(), cookie()}
+  | {error, failed_to_open_cookie_box | invalid_welcome_box_contents}.
 decode_welcome_packet(Packet, SLP, CSS) ->
   #welcome_packet{nonce=Nonce, box=Box} = Packet,
   NonceString = nonce_string(welcome, Nonce),
@@ -371,6 +405,8 @@ decode_welcome_packet(Packet, SLP, CSS) ->
       {error, failed_to_open_cookie_box}
   end.
 
+-spec decode_welcome_box_contents(binary())
+  -> {ok, key(), cookie()} | {error, invalid_welcome_box_contents}.
 decode_welcome_box_contents(<<SSP:32/binary, Cookie:96/binary>>) ->
   {ok, SSP, Cookie};
 decode_welcome_box_contents(_Contents) ->
@@ -383,6 +419,8 @@ decode_welcome_box_contents(_Contents) ->
 %%  the vouch (V) (96 octets) and the metadata (>= 0 octets) encrypted from the
 %%  client short-term public key (CSP) to the servers short-term public key (SSP)
 %%  Box[C, V](C', S')
+-spec encode_initiate_packet(cookie(), key(), key(), module(), key(), key(), pos_integer())
+  -> binary().
 encode_initiate_packet(Cookie, SSP, SLP, Vault, CSP, CSS, NonceCounter) ->
   CLP = Vault:public_key(),
   Vouch = encode_vouch(CSP, SLP, SSP, Vault),
@@ -401,6 +439,7 @@ encode_initiate_packet(Cookie, SSP, SLP, Vault, CSP, CSS, NonceCounter) ->
 %%    Box[C', S](C -> S')
 %%    - Create using server short-term public key and client long-term secret key
 %%    - Open using client long-term public key and server short-term secret key
+-spec encode_vouch(key(), key(), key(), module()) -> binary().
 encode_vouch(CSP, SLP, SSP, Vault) ->
   Nonce = enacl:randombytes(16),
   NonceString = nonce_string(vouch, Nonce),
@@ -409,6 +448,8 @@ encode_vouch(CSP, SLP, SSP, Vault) ->
   <<Nonce/binary, Box/binary>>.
 
 %% Verify the cookie. Open the initiate box and verify the vouched keys.
+-spec decode_initiate_packet(initiate_packet(), key(), module())
+  -> {ok, <<_:256>>} | {error, invalid_initiate_box_contents}.
 decode_initiate_packet(Packet, CSP, Vault) ->
   #initiate_packet{cookie=Cookie, nonce=Nonce, box=Box} = Packet,
   case verify_cookie(Cookie, CSP) of
@@ -425,6 +466,8 @@ decode_initiate_packet(Packet, CSP, Vault) ->
 
 %% Open the cookie to retrieve the boxed client short-term public key (CSP) and
 %% the servers short-term secret key (SSS)
+-spec verify_cookie(binary(), key())
+  -> {ok, <<_:256>>} | {error, invalid_cookie}.
 verify_cookie(<<Nonce:16/binary, Box:80/binary>>, CSP) ->
   MinuteKeys = ecurvecp_cookie:keys(),
   NonceString = nonce_string(minute_key, Nonce),
@@ -434,6 +477,8 @@ verify_cookie(_Cookie, _CSP) ->
 
 %% Open the cookie with the current minute. If the current key doesn't work
 %% use the previous. If neither work, fail.
+-spec minute_key_cookie_verify(<<_:192>>, binary(), key(), [key()])
+  -> {ok, <<_:256>>} | {error, invalid_cookie}.
 minute_key_cookie_verify(_NonceString, _Box, _CSP, []) ->
   {error, invalid_cookie};
 minute_key_cookie_verify(NonceString, Box, CSP, [Curr|Prev]) ->
@@ -444,6 +489,8 @@ minute_key_cookie_verify(NonceString, Box, CSP, [Curr|Prev]) ->
       minute_key_cookie_verify(NonceString, Box, CSP, Prev)
   end.
 
+-spec verify_cookie_box_contents(binary(), key())
+  -> {ok, <<_:256>>} | {error, invalid_cookie}.
 verify_cookie_box_contents(<<BoxedCSP:32/binary, BoxedSSS:32/binary>>, CSP) ->
   case enacl:verify_32(BoxedCSP, CSP) of
     true ->
@@ -455,6 +502,8 @@ verify_cookie_box_contents(_Contents, _CSP) ->
   {error, invalid_cookie}.
 
 %% Open Box[C, V](C' -> S') with (C',s'). Verify the contents of the vouch.
+-spec verify_initiate_box(short_nonce(), binary(), key(), key(), module())
+  -> boolean() | {error, invalid_initiate_box | invalid_vouch}.
 verify_initiate_box(Nonce, Box, CSP, SSS, Vault) ->
   NonceString = nonce_string(initiate, Nonce),
   case enacl:box_open(Box, NonceString, CSP, SSS) of
@@ -468,6 +517,8 @@ verify_initiate_box(Nonce, Box, CSP, SSS, Vault) ->
 %% Open Vouch Box[C', S](C -> S') with (C, s') and verify the boxed client short-term public key
 %% is identical the one received in the initiate box. Further verify that the boxed
 %% server long-term public key is identical to the one in the vault.
+-spec verify_vouch(key(), key(), long_nonce(), binary(), key(), key())
+  -> boolean().
 verify_vouch(CLP, CSP, Nonce, Box, SLP, SSS) ->
   NonceString = nonce_string(vouch, Nonce),
   case enacl:box_open(Box, NonceString, CLP, SSS) of
@@ -481,6 +532,7 @@ verify_vouch(CLP, CSP, Nonce, Box, SLP, SSS) ->
 %% server short nonce - (8 octets) implicitly prefixed with 16 octets to form 24 octet nonce
 %% box - (>= 16 octets) including any metadata encrypted from the servers short-term public key
 %% to the client short-term public key. Box[M](C' -> S')
+-spec encode_ready_packet(pos_integer(), key(), key()) -> binary().
 encode_ready_packet(NonceCounter, CSP, SSS) ->
   Nonce = <<NonceCounter:64/unsigned-little-integer>>,
   NonceString = nonce_string(ready, Nonce),
@@ -489,6 +541,8 @@ encode_ready_packet(NonceCounter, CSP, SSS) ->
   <<?READY, Nonce/binary, Box/binary>>.
 
 %% Open Box[M](C' -> S') with (S', c')
+-spec decode_ready_packet(ready_packet(), key(), key())
+  -> {ok, binary()} | {error, invalid_ready_box}.
 decode_ready_packet(Packet, SSP, CSS) ->
   #ready_packet{nonce=Nonce, box=Box} = Packet,
   NonceString = nonce_string(ready, Nonce),
@@ -502,12 +556,15 @@ decode_ready_packet(Packet, SSP, CSS) ->
 %% Box[M](C' -> S')
 %% Message data encoded from the sender's short-term key to receiver's
 %% short-term key
+-spec encode_msg_packet(binary(), side(), pos_integer(), key()) -> binary().
 encode_msg_packet(Msg, Side, NonceCounter, Key) ->
   Nonce = <<NonceCounter:64/unsigned-little-integer>>,
   NonceString = nonce_string(Side, Nonce),
   Box = enacl:box_afternm(Msg, NonceString, Key),
   <<?MESSAGE, Nonce/binary, Box/binary>>.
 
+-spec decode_msg_packet(msg_packet(), side(), key())
+  -> {ok, binary()} | {error, failed_verification}.
 decode_msg_packet(Packet, Side, Key) ->
   #msg_packet{nonce=Nonce, box=Box} = Packet,
   NonceString = case Side of
@@ -770,6 +827,9 @@ terminate(_Reason, _StateName, StateData) ->
 code_change(_OldVsn, StateName, StateData, _Extra) ->
   {ok, StateName, StateData}.
 
+-spec handle_tcp(iodata(), atom(), state_data())
+  -> {next_state, atom(), state_data()}
+  | {stop, atom(), term(), state_data()}.
 handle_tcp(Data, StateName, StateData) ->
   case parse_packet(Data) of
     {ok, Packet} ->
@@ -785,9 +845,11 @@ handle_tcp(Data, StateName, StateData) ->
       transition_close(StateData)
   end.
 
+-spec handle_tcp_closed(state_data()) -> {stop, normal, state_data()}.
 handle_tcp_closed(StateData) ->
   {stop, normal, StateData#st{socket=undefined}}.
 
+-spec transition_close(state_data()) -> {next_state, closed, state_data()}.
 transition_close(StateData) ->
   #st{socket=Socket, active=Active, controller={Controller, _}, from=From} = StateData,
   ok = gen_tcp:close(Socket),
@@ -806,10 +868,12 @@ transition_close(StateData) ->
   end,
   {next_state, closed, StateData#st{socket=undefined, from=undefined}}.
 
+-spec start_fsm() -> {ok, pid()}.
 start_fsm() ->
   Controller = self(),
   ecurvecp_connection_sup:start_child([Controller]).
 
+-spec process_recv_queue(state_data()) -> {next_state, established, state_data()}.
 process_recv_queue(StateData) ->
   #st{recv_queue=Queue, buffer=Buffer, socket=Socket} = StateData,
   case {queue:out(Queue), Buffer} of
@@ -823,6 +887,7 @@ process_recv_queue(StateData) ->
       {next_state, established, StateData}
   end.
 
+-spec verify_nonce_count(ecurvecp_packet() | short_nonce(), state_data() | integer()) -> boolean().
 verify_nonce_count(#hello_packet{nonce=N}, #st{received_nonce_counter=RC}) ->
   verify_nonce_count(N, RC);
 verify_nonce_count(#initiate_packet{nonce=N}, #st{received_nonce_counter=RC}) ->
@@ -834,6 +899,7 @@ verify_nonce_count(<<N:64/unsigned-little-integer>>, RC) when is_integer(RC) ->
 verify_nonce_count(_Packet, _StateData) ->
   true.
 
+-spec nonce_string(nonce_key(), nonce()) -> <<_:192>>.
 nonce_string(hello, <<_:8/binary>> = Nonce) ->
   <<"CurveCP-client-H", Nonce/binary>>;
 nonce_string(welcome, <<_:16/binary>> = Nonce) ->

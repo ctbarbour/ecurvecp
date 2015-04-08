@@ -8,19 +8,24 @@
 -define(TAB, ?MODULE).
 
 -record(st, {
-    public_key,
-    secret_key
+    public_key :: <<_:256>>,
+    secret_key :: <<_:256>>
   }).
 
+-spec start_link(#{}) -> {ok, pid()}.
 start_link(#{public := PK, secret := SK}) ->
   gen_server:start_link({local, ?MODULE}, ?MODULE, [PK, SK], []).
 
+-spec public_key() -> binary().
 public_key() ->
   gen_server:call(?MODULE, public_key).
 
+-spec box(binary(), binary(), binary()) -> binary().
 box(Msg, Nonce, PK) ->
   gen_server:call(?MODULE, {box, Msg, Nonce, PK}).
 
+-spec box_open(binary(), binary(), binary())
+  -> {ok, binary()} | {error, failed_verification}.
 box_open(Box, Nonce, PK) ->
   gen_server:call(?MODULE, {box_open, Box, Nonce, PK}).
 
