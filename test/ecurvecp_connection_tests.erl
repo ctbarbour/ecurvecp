@@ -14,7 +14,6 @@
     short_term_keypair,
     long_term_keypair,
     peer_short_term_pk,
-    peer_pk,
     last_msg
   }).
 
@@ -34,10 +33,9 @@ cleanup(_) ->
 
 check() ->
   case proper:quickcheck(server_handshake_prop(), [{to_file, user}]) of
-    [] ->
+    true ->
       true;
-    Other ->
-      ?debugFmt("Quickcheck failure: ~p~n", [Other]),
+    _Other ->
       false
   end.
 
@@ -48,22 +46,23 @@ hello(S) ->
   [{initiate, {call, ?MODULE, send_hello, [{var, sender}, S#st.sender_nonce_counter, S#st.short_term_keypair, {var, peer_pk}]}}].
 
 initiate(S) ->
-  [{established, {call, ?MODULE, send_initiate, [{var, sender}, S#st.short_term_keypair, S#st.long_term_keypair, S#st.peer_pk, S#st.sender_nonce_counter, S#st.last_msg]}}].
+  [{established, {call, ?MODULE, send_initiate, [{var, sender}, S#st.short_term_keypair, S#st.long_term_keypair, {var, peer_pk}, S#st.sender_nonce_counter, S#st.last_msg]}}].
 
 established(S) ->
-  [{established, {call, ?MODULE, send_msg, [{var, sender}, S#st.short_term_keypair, S#st.peer_short_term_pk, S#st.sender_nonce_counter, binary()]}}].
+  [{established, {call, ?MODULE, send_msg, [{var, sender}, binary(), S#st.sender_nonce_counter, S#st.peer_short_term_pk, S#st.short_term_keypair]}}].
 
 initial_state() ->
   accept.
 
 initial_state_data() ->
-  #st{sender_nonce_counter=0}.
+  #st{sender_nonce_counter=1, long_term_keypair=enacl:box_keypair()}.
 
 next_state_data(accept, hello, S, _Sender, {call, _, _, _}) ->
   S#st{short_term_keypair=enacl:box_keypair()};
-next_state_data(hello, initiate, S, Welcome, {call, _, _, _}) ->
+next_state_data(hello, initiate, S, Welcome, {call, _, _, [_, _, ShortTermKeypair, PeerPK]}) ->
+  #{secret := SK} = ShortTermKeypair,
   #st{sender_nonce_counter=NC} = S,
-  S#st{last_msg=Welcome, sender_nonce_counter=NC+1};
+  S#st{last_msg=Welcome, sender_nonce_counter=NC+1, peer_short_term_pk={call, ?MODULE, peer_short_term_pk, [Welcome, PeerPK, SK]}};
 next_state_data(initiate, established, S, Ready, {call, _, _, _}) ->
   #st{sender_nonce_counter=NC} = S,
   S#st{last_msg=Ready, sender_nonce_counter=NC+1};
@@ -78,57 +77,56 @@ postcondition(accept, hello, _S, {call, ?MODULE, connect, [_, _, _]}, Resp) ->
   ok =:= Resp;
 postcondition(hello, initiate, _S, {call, ?MODULE, send_hello, [_, _, ShortTermKeypair, PeerPK]}, Welcome) ->
   #{secret := SK} = ShortTermKeypair,
-  case Welcome of
-    <<"RL3aNMXK", Nonce:16/binary, Box:144/binary>> ->
-      NString = <<"CurvecpCPK", Nonce/binary>>,
-      case enacl:box_open(Box, NString, PeerPK, SK) of
-        {ok, <<_SSP:32/binary, _Cookie:96/binary>>} ->
+  case decode_welcome(Welcome, PeerPK, SK) of
+    {ok, _, _} ->
+      true;
+    _Other ->
+      false
+  end;
+postcondition(initiate, established, _S, {call, ?MODULE, send_initiate, [_, ShortKey, _LongKey, PeerPK, _NC, Welcome]}, Ready) ->
+  #{secret := SK} = ShortKey,
+  case decode_welcome(Welcome, PeerPK, SK) of
+    {ok, SSP, _Cookie} ->
+      case Ready of
+        <<"RL3aNMXR", Nonce:8/binary, Box/binary>> ->
+          NString = <<"CurveCP-server-R", Nonce/binary>>,
+          case enacl:box_open(Box, NString, SSP, SK) of
+            {ok, _Contents} ->
+              true;
+            {error, failed_verification} ->
+              false
+          end;
+        _ ->
+          false
+      end;
+    _ ->
+      false
+  end;
+postcondition(established, established, _S, {call, ?MODULE, send_msg, [_, _, _, PK, ShortKey]}, R) ->
+  #{secret := SK} = ShortKey,
+  case R of
+    <<"RL3aNMXM", Nonce:8/binary, Box/binary>> ->
+      NString = <<"CurveCP-server-M", Nonce/binary>>,
+      case enacl:box_open(Box, NString, PK, SK) of
+        {ok, _Contents} ->
           true;
         {error, failed_verification} ->
           false
       end;
     _ ->
       false
-  end;
-postcondition(initiate, established, _S, {call, ?MODULE, send_initiate, [_, ShortKey, LongKey, PeerKey, NC, Welcome]}, Ready) ->
-  #{public := PeerPK} = PeerKey,
-  #{secret := SK} = ShortKey,
-  case Welcome of
-    <<"RL3aNMXK", WNonce:16/binary, WBox:144/binary>> ->
-      WNString = <<"CurvecpCPK", WNonce/binary>>,
-      case enacl:box_open(WBox, WNString, PeerPK, SK) of
-        {ok, <<SSP:32/binary, _Cookie:96/binary>>} ->
-          case Ready of
-            <<"RL3aNMXR", Nonce:8/binary, Box/binary>> ->
-              NString = <<"CurveCP-server-R", Nonce/binary>>,
-              case enacl:box_open(Box, NString, SSP, SK) of
-                {ok, _Contents} ->
-                  true;
-                {error, failed_verification} ->
-                  false
-              end;
-            _ ->
-              false
-          end;
-        {error, failed_verification} ->
-          false
-      end;
-    _ ->
-      false
-  end;
-postcondition(established, established, _S, {call, ?MODULE, send_msg, _}, R) ->
-  true.
+  end.
 
 connect(Sender, Ip, Port) ->
   simple_sender:connect(Sender, Ip, Port).
 
 send_hello(Sender, NC, ShortTermKeypair, PeerKey) ->
-  #{secret := SK} = ShortTermKeypair,
+  #{public := PK, secret := SK} = ShortTermKeypair,
   Zeros = binary:copy(<<0>>, 64),
   Nonce = <<NC:64/unsigned-little-integer>>,
   NString = <<"CurveCP-client-H", Nonce/binary>>,
   Box = enacl:box(Zeros, NString, PeerKey, SK),
-  Packet = <<"QvnQ5XlH", 1:8/integer, 0:8/integer, Zeros/binary, Nonce/binary, Box/binary>>,
+  Packet = <<"QvnQ5XlH", 1/integer, 0/integer, Zeros/binary, PK/binary, Nonce/binary, Box/binary>>,
   do_send(Sender, Packet).
 
 send_initiate(Sender, ShortKey, LongKey, PeerPK, NC, Welcome) ->
@@ -136,7 +134,7 @@ send_initiate(Sender, ShortKey, LongKey, PeerPK, NC, Welcome) ->
   #{public := SP, secret := SS} = ShortKey,
   case Welcome of
     <<"RL3aNMXK", Nonce:16/binary, Box:144/binary>> ->
-      NString = <<"CurvecpCPK", Nonce/binary>>,
+      NString = <<"CurveCPK", Nonce/binary>>,
       case enacl:box_open(Box, NString, PeerPK, SS) of
         {ok, <<SSP:32/binary, Cookie:96/binary>>} ->
           INonce = <<NC:64/unsigned-little-integer>>,
@@ -149,7 +147,6 @@ send_initiate(Sender, ShortKey, LongKey, PeerPK, NC, Welcome) ->
           IPlaintext = <<LP/binary, Vouch/binary, 0/integer>>,
           IBox = enacl:box(IPlaintext, INString, SSP, SS),
           IPacket = <<"QvnQ5XlI", Cookie/binary, INonce/binary, IBox/binary>>,
-          ?debugFmt("Sending initiate: ~p~n", [IPacket]),
           do_send(Sender, IPacket);
         {error, failed_verification} ->
           false
@@ -158,12 +155,18 @@ send_initiate(Sender, ShortKey, LongKey, PeerPK, NC, Welcome) ->
       false
   end.
 
+send_msg(Sender, Msg, NC, PK, Keypair) ->
+  #{secret := SK} = Keypair,
+  Nonce = <<NC:64/unsigned-little-integer>>,
+  NString = <<"CurveCP-client-M", Nonce/binary>>,
+  Box = enacl:box(Msg, NString, PK, SK),
+  Packet = <<"RL3aNMXM", Nonce/binary, Box/binary>>,
+  do_send(Sender, Packet).
+
 do_send(Sender, Packet) ->
   ok = simple_sender:send(Sender, Packet),
-  ?debugFmt("Sent ~p~n", [Sender]),
   case simple_sender:recv(Sender) of
     {tcp, Data} ->
-      ?debugFmt("Received: ~p~n", [Data]),
       Data;
     {error, Error} ->
       {error, Error}
@@ -171,12 +174,57 @@ do_send(Sender, Packet) ->
 
 server_handshake_prop() ->
   #{public := PK} = application:get_env(ecurvecp, long_term_keypair, undefined),
-  Listener = simple_listener:start(?PORT),
+  {ok, LSock} = ecurvecp_connection:listen([{port, ?PORT}]),
+  _Acceptors = start_acceptors(100, LSock),
   ?FORALL(Cmds, proper_fsm:commands(?MODULE),
           begin
             Sender = simple_sender:start(),
-            {H, S, Res} = proper_fsm:run_commands(?MODULE, Cmds, [{peer_pk, PK}, {listener, Listener}, {sender, Sender}, {ip, ?IP}, {port, ?PORT}]),
-            ?WHENFAIL(io:format("History: ~p~nState: ~p~nResult: ~p~n",
-                                [H, S, Res]),
-                      Res =:= ok)
+            {H, S, Res} = proper_fsm:run_commands(?MODULE, Cmds, [{peer_pk, PK}, {sender, Sender}, {ip, ?IP}, {port, ?PORT}]),
+            ?WHENFAIL(
+              io:format("History: ~p\nState: ~p\nResult: ~p\n", [H, S, Res]),
+              Res =:= ok)
           end).
+
+start_acceptors(0, _) ->
+  ok;
+start_acceptors(Num, LSock) ->
+  spawn(fun() ->
+        case ecurvecp_connection:accept(LSock, infinity) of
+          {ok, Sock} ->
+            fun Loop() ->
+              ok = ecurvecp_connection:setopts(Sock, [{active, once}]),
+              receive
+                {ecurvecp, Sock, Data} ->
+                  ok = ecurvecp_connection:send(Sock, Data),
+                  Loop();
+                _Other ->
+                  ok
+              end
+            end();
+          {error, Reason} ->
+            {error, Reason}
+        end
+    end),
+  start_acceptors(Num-1, LSock).
+
+decode_welcome(Welcome, PK, SK) ->
+  case Welcome of
+    <<"RL3aNMXK", Nonce:16/binary, Box:144/binary>> ->
+      NString = <<"CurveCPK", Nonce/binary>>,
+      case enacl:box_open(Box, NString, PK, SK) of
+        {ok, <<SSP:32/binary, Cookie:96/binary>>} ->
+          {ok, SSP, Cookie};
+        {error, failed_verification} ->
+          {error, failed_verification}
+      end;
+    _ ->
+      {error, invalid_welcome_packet}
+  end.
+
+peer_short_term_pk(Welcome, PK, SK) ->
+  case decode_welcome(Welcome, PK, SK) of
+    {ok, SSP, _} ->
+      SSP;
+    Error ->
+      Error
+  end.

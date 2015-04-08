@@ -526,7 +526,6 @@ waiting({accept, LSock, Timeout}, From, StateData) ->
     {ok, Socket} ->
       {ok, Peer} = inet:peername(Socket),
       ok = inet:setopts(Socket, [{active, once}]),
-      ok = error_logger:info_msg("[~p] Accepted connection from ~p~n", [self(), Peer]),
       {next_state, hello, StateData#st{from=From, socket=Socket,
                                        handshake_ttl=HandshakeTTL,
                                        peer=Peer,
@@ -572,7 +571,7 @@ waiting({connect, Address, Port, Opts}, From, StateData) ->
       {stop, normal, {error, Reason}, StateData}
   end;
 waiting(Msg, _From, State) ->
-  ok = error_logger:info_msg("Received unmatched event ~p in state waiting.", [Msg]),
+  ok = error_logger:warning_msg("Received unmatched event ~p in state waiting.", [Msg]),
   {stop, normal, badmatch, State}.
 
 %% From internal tcp socket
@@ -625,7 +624,6 @@ hello(#hello_packet{} = Packet, StateData) ->
   #st{handshake_ttl=Timeout, socket=Socket, vault=Vault, received_nonce_counter=RN} = StateData,
   case decode_hello_packet(Packet, Vault) of
     {ok, CSP, Version} ->
-      ok = error_logger:info_msg("[~p] Received hello packet ~p~n", [self(), Packet]),
       #{public := SSP, secret := SSS} = enacl:box_keypair(),
       WelcomePacket = encode_welcome_packet(CSP, SSP, SSS, Vault),
       case gen_tcp:send(Socket, WelcomePacket) of
@@ -718,7 +716,7 @@ ready(timeout, StateData) ->
   transition_close(StateData).
 
 handle_event(Event, StateName, StateData) ->
-  ok = error_logger:info_msg("Unmatched event ~p in state ~p", [Event, StateName]),
+  ok = error_logger:warning_msg("Unmatched event ~p in state ~p", [Event, StateName]),
   {next_state, StateName, StateData}.
 
 handle_sync_event({controlling_process, Controller}, {PrevController, _}, StateName,
@@ -748,19 +746,17 @@ handle_sync_event({setopts, Opts}, _From, StateName, StateData) ->
       {reply, ok, StateName, StateData}
   end;
 handle_sync_event(Event, _From, StateName, StateData) ->
-  error_logger:info_msg("Unmatched sync_event ~p in state ~p", [Event, StateName]),
+  error_logger:warning_msg("Unmatched sync_event ~p in state ~p", [Event, StateName]),
   {next_state, StateName, StateData}.
 
 handle_info({tcp, Socket, Data}, StateName, #st{socket=Socket} = StateData) ->
-  ok = error_logger:info_msg("[~p] Received tcp data: ~p~n", [self(), Data]),
   handle_tcp(Data, StateName, StateData);
 handle_info({tcp_closed, Socket}, _StateName, #st{socket=Socket} = StateData) ->
-  ok = error_logger:info_msg("[~p] TCP closed", [self()]),
   handle_tcp_closed(StateData);
 handle_info({'DOWN', MRef, process, Controller, _Reason}, _StateName, #st{controller={Controller, MRef}} = StateData) ->
   {stop, normal, StateData};
 handle_info(Info, StateName, StateData) ->
-  error_logger:info_msg("Unmatched info ~p in state ~p", [Info, StateName]),
+  error_logger:warning_msg("Unmatched info ~p in state ~p", [Info, StateName]),
   {next_state, StateName, StateData}.
 
 terminate(_Reason, _StateName, StateData) ->
@@ -781,9 +777,11 @@ handle_tcp(Data, StateName, StateData) ->
         true ->
           ?MODULE:StateName(Packet, StateData);
         false ->
+          ok = error_logger:info_msg("invalid nonce count ~p~n", [Packet]),
           transition_close(StateData)
       end;
     {error, _Reason} ->
+      ok = error_logger:info_msg("Failed to parse packet ~p~n", [Data]),
       transition_close(StateData)
   end.
 

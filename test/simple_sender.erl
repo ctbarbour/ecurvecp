@@ -5,7 +5,7 @@ start() ->
   spawn_link(?MODULE, init, []).
 
 init() ->
-  loop(undefiend).
+  loop(undefiend, undefined).
 
 connect(Pid, Ip, Port) ->
   Pid ! {connect, Ip, Port, self()},
@@ -22,7 +22,7 @@ recv(Pid) ->
   Pid ! {recv, self()},
   receive
     Data ->
-      Data
+      {tcp, Data}
   end.
 
 close(Pid) ->
@@ -36,32 +36,29 @@ exit(Pid) ->
       ok
   end.
 
-loop(Socket) ->
+loop(Socket, F) ->
   receive
     {connect, Ip, Port, From} ->
-      ok = error_logger:info_msg("[~p] Connecting to ~p:~p~n", [self(), Ip, Port]),
       case gen_tcp:connect(Ip, Port, [{packet, 2}, binary, {active, false}], 5000) of
         {ok, S} ->
           From ! ok,
-          loop(S);
+          loop(S, undefined);
         Error ->
           From ! Error
       end;
     {send, Packet} ->
       ok = gen_tcp:send(Socket, Packet),
-      loop(Socket);
+      loop(Socket, F);
     {recv, From} ->
-      case gen_tcp:recv(Socket, 5000) of
-        {ok, Data} ->
-          From ! {tcp, Data};
-        Error ->
-          From ! Error
-      end;
+      ok = inet:setopts(Socket, [{active, once}]),
+      loop(Socket, From);
+    {tcp, Socket, Data} ->
+      F ! Data,
+      loop(Socket, undefined);
     close ->
       catch gen_tcp:close(Socket),
-      loop(undefined);
+      loop(undefined, undefined);
     {exit, From} ->
       From ! ok,
       ok
   end.
-
