@@ -31,7 +31,8 @@ eunit: compile
 	@$(REBAR) eunit skip_deps=true
 
 ct: compile
-	@$(REBAR) ct skip_deps=true
+	ct_run -pa ./ebin -pa ./deps/*/ebin -dir ./test/ -logdir ./test/logs/
+	@open ./test/logs/index.html
 
 doc: compile
 	@$(REBAR) skip_deps=true doc
@@ -47,6 +48,6 @@ dialyze: compile $(DIALYZER_PLT)
 shell: all
 	@$(ERL) \
 		-sname $(SNAME) \
-		-pa ./ebin -pa ./deps/*/ebin \
+		-pa ./ebin -pa ./deps/*/ebin -pa ./test \
 		-boot start_sasl \
 		-config ./config/sys.config

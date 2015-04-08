@@ -524,8 +524,9 @@ waiting({accept, LSock, Timeout}, From, StateData) ->
   ConnectionTTL = 360000,
   case gen_tcp:accept(LSock, Timeout) of
     {ok, Socket} ->
-      Peer = inet:peername(Socket),
+      {ok, Peer} = inet:peername(Socket),
       ok = inet:setopts(Socket, [{active, once}]),
+      ok = error_logger:info_msg("[~p] Accepted connection from ~p~n", [self(), Peer]),
       {next_state, hello, StateData#st{from=From, socket=Socket,
                                        handshake_ttl=HandshakeTTL,
                                        peer=Peer,
@@ -595,7 +596,7 @@ established(#msg_packet{} = Packet, StateData) ->
       {stop, Error, StateData}
   end;
 established(_Packet, StateData) ->
-  transition_close(StateData).
+  {stop, badarg, StateData}.
 
 %% From public API
 established({send, Msg}, _From, StateData) ->
@@ -617,14 +618,14 @@ established(close, _From, StateData) ->
   ok = gen_tcp:close(Socket),
   {stop, normal, ok, StateData#st{socket=undefined}};
 established(Event, _From, StateData) ->
-  ok = error_logger:info_msg("Unmatched event ~p in state established", [Event]),
-  {next_state, established, StateData}.
+  {stop, {badarg, Event}, StateData}.
 
 %% Server States
 hello(#hello_packet{} = Packet, StateData) ->
   #st{handshake_ttl=Timeout, socket=Socket, vault=Vault, received_nonce_counter=RN} = StateData,
   case decode_hello_packet(Packet, Vault) of
     {ok, CSP, Version} ->
+      ok = error_logger:info_msg("[~p] Received hello packet ~p~n", [self(), Packet]),
       #{public := SSP, secret := SSS} = enacl:box_keypair(),
       WelcomePacket = encode_welcome_packet(CSP, SSP, SSS, Vault),
       case gen_tcp:send(Socket, WelcomePacket) of
@@ -751,8 +752,10 @@ handle_sync_event(Event, _From, StateName, StateData) ->
   {next_state, StateName, StateData}.
 
 handle_info({tcp, Socket, Data}, StateName, #st{socket=Socket} = StateData) ->
+  ok = error_logger:info_msg("[~p] Received tcp data: ~p~n", [self(), Data]),
   handle_tcp(Data, StateName, StateData);
 handle_info({tcp_closed, Socket}, _StateName, #st{socket=Socket} = StateData) ->
+  ok = error_logger:info_msg("[~p] TCP closed", [self()]),
   handle_tcp_closed(StateData);
 handle_info({'DOWN', MRef, process, Controller, _Reason}, _StateName, #st{controller={Controller, MRef}} = StateData) ->
   {stop, normal, StateData};

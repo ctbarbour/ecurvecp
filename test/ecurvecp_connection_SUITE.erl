@@ -18,6 +18,7 @@ groups() ->
   [{basic, [shuffle, {repeat, 30}], [handshake]}].
 
 init_per_suite(Config) ->
+  ok = error_logger:tty(false),
   ok = application:load(ecurvecp),
   Keypair = enacl:box_keypair(),
   ok = application:set_env(ecurvecp, long_term_keypair, Keypair),
@@ -41,7 +42,8 @@ handshake(Config) ->
   #{public := PK} = ?config(keypair, Config),
   Server = start_server(Port),
   Client = start_client(Host, Port, PK),
-  true = wait_all([Client, Server]).
+  true = wait_all([Client, Server]),
+  ok.
 
 wait_all([]) ->
   true;
@@ -62,17 +64,11 @@ start_server(Port) ->
         {ok, LSock} = ecurvecp_connection:listen([{port, Port}]),
         {ok, Socket} = ecurvecp_connection:accept(LSock, 5000),
         {ok, <<"1">>} = ecurvecp_connection:recv(Socket, 5000),
-        ct:pal("[~p] Received 1", [self()]),
         ok = ecurvecp_connection:send(Socket, <<"1">>),
-        ct:pal("[~p] Sent 1", [self()]),
         {ok, <<"2">>} = ecurvecp_connection:recv(Socket, 5000),
-        ct:pal("[~p] Received 2", [self()]),
         ok = ecurvecp_connection:send(Socket, <<"2">>),
-        ct:pal("[~p] Sent 2", [self()]),
         {ok, <<"3">>} = ecurvecp_connection:recv(Socket, 5000),
-        ct:pal("[~p] Received 3", [self()]),
         ok = ecurvecp_connection:send(Socket, <<"3">>),
-        ct:pal("[~p] Sent 3", [self()]),
         ok = ecurvecp_connection:close(Socket),
         Caller ! {ok, self()}
     end).
@@ -80,20 +76,13 @@ start_server(Port) ->
 start_client(Host, Port, Key) ->
   Caller = self(),
   spawn(fun() ->
-        ct:sleep(50),
         {ok, Socket} = ecurvecp_connection:connect(Host, Port, [{peer_long_term_public_key, Key}], 5000),
-        ct:pal("[~p] Sent 1", [self()]),
         ok = ecurvecp_connection:send(Socket, <<"1">>),
         {ok, <<"1">>} = ecurvecp_connection:recv(Socket, 5000),
-        ct:pal("[~p] Received 1", [self()]),
         ok = ecurvecp_connection:send(Socket, <<"2">>),
-        ct:pal("[~p] Sent 2", [self()]),
         {ok, <<"2">>} = ecurvecp_connection:recv(Socket, 5000),
-        ct:pal("[~p] Received 2", [self()]),
         ok = ecurvecp_connection:send(Socket, <<"3">>),
-        ct:pal("[~p] Sent 3", [self()]),
         {ok, <<"3">>} = ecurvecp_connection:recv(Socket, 5000),
-        ct:pal("[~p] Received 3", [self()]),
         ok = ecurvecp_connection:close(Socket),
         Caller ! {ok, self()}
     end).
