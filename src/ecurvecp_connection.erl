@@ -13,14 +13,11 @@
 -define(VERSION, <<?MAJOR_V/integer, ?MINOR_V/integer>>).
 -define(COUNT_LIMIT, 18446744073709551616 - 1).
 
--export([name/0,
-         secure/0,
-         messages/0,
+-export([messages/0,
          accept/2,
-         accept_ack/2,
          listen/1,
-         connect/3, connect/4,
-         recv/2, recv/3,
+         connect/4,
+         recv/2,
          send/2,
          controlling_process/2,
          close/1,
@@ -150,21 +147,9 @@
   | initiate_packet() | ready_packet() | msg_packet().
 -type state_data()        :: #st{}.
 
--spec name() -> atom().
-name() ->
-  ecurvecp.
-
--spec secure() -> boolean().
-secure() ->
-  true.
-
 -spec messages() -> {atom(), atom(), atom()}.
 messages() ->
   {ecurvecp, ecurvecp_closed, ecurvecp_error}.
-
--spec accept_ack(socket(), timeout()) -> ok.
-accept_ack(_Socket, _Timeout) ->
-  ok.
 
 -spec setopts(socket(), opts()) -> ok.
 setopts(Socket, Opts) ->
@@ -220,11 +205,6 @@ accept(#ecurvecp_lsock{lsock=LSock}, Timeout) ->
       {error, Reason}
   end.
 
--spec connect(address(), inet:port_number(), opts())
-  -> {ok, csock()} | {error, atom()}.
-connect(Address, Port, Opts) ->
-  connect(Address, Port, Opts, infinity).
-
 -spec connect(address(), inet:port_number(), opts(), timeout())
   -> {ok, socket()} | {error, atom()}.
 connect(Address, Port, Opts, Timeout) ->
@@ -247,11 +227,6 @@ send(#ecurvecp_socket{pid=Pid}, Packet) ->
     {'EXIT', {noproc, _}} ->
       {error, closed}
   end.
-
--spec recv(socket(), pos_integer(), timeout())
-  -> {ok, term()} | {error, closed | timeout | atom()}.
-recv(Socket, _Length, Timeout) ->
-  recv(Socket, Timeout).
 
 -spec recv(socket(), timeout())
   -> {ok, term()} | {error, closed | timeout | atom()}.
@@ -281,6 +256,8 @@ init([Controller]) ->
               received_nonce_counter=0,
               vault=ecurvecp_vault,
               active=false,
+              handshake_ttl=60000,
+              connection_ttl=360000,
               recv_queue=queue:new()},
   {ok, waiting, State}.
 
@@ -577,20 +554,17 @@ decode_msg_packet(Packet, Side, Key) ->
 
 %% Server and Client States
 waiting({accept, LSock, Timeout}, From, StateData) ->
-  HandshakeTTL = 60000,
-  ConnectionTTL = 360000,
+  #st{handshake_ttl=HandshakeTTL} = StateData,
   case gen_tcp:accept(LSock, Timeout) of
     {ok, Socket} ->
       {ok, Peer} = inet:peername(Socket),
       ok = inet:setopts(Socket, [{active, once}]),
       {next_state, hello, StateData#st{from=From, socket=Socket,
-                                       handshake_ttl=HandshakeTTL,
                                        peer=Peer,
-                                       side=server,
-                                       connection_ttl=ConnectionTTL},
+                                       side=server},
        HandshakeTTL};
     {error, _Reason} = Error ->
-      ok = error_logger:info_msg("Accept error ~p\n", [Error]),
+      ok = error_logger:warning_msg("Accept error ~p\n", [Error]),
       {stop, normal, Error, StateData}
   end;
 waiting({connect, Address, Port, Opts}, From, StateData) ->
@@ -630,7 +604,7 @@ waiting({connect, Address, Port, Opts}, From, StateData) ->
   end;
 waiting(Msg, _From, State) ->
   ok = error_logger:warning_msg("Received unmatched event ~p in state waiting.", [Msg]),
-  {stop, normal, badmatch, State}.
+  {next_state, waiting, State}.
 
 %% From internal tcp socket
 established(#msg_packet{} = Packet, StateData) ->
@@ -653,9 +627,7 @@ established(#msg_packet{} = Packet, StateData) ->
       {stop, Error, StateData}
   end;
 established(timeout, StateData) ->
-  transition_close(StateData);
-established(_Packet, StateData) ->
-  {stop, badarg, StateData}.
+  transition_close(handshake_timeout, StateData).
 
 %% From public API
 established({send, Msg}, _From, StateData) ->
@@ -675,9 +647,7 @@ established(recv, From, StateData) ->
 established(close, _From, StateData) ->
   #st{socket=Socket} = StateData,
   ok = gen_tcp:close(Socket),
-  {stop, normal, ok, StateData#st{socket=undefined}};
-established(Event, _From, StateData) ->
-  {stop, {badarg, Event}, StateData}.
+  {stop, normal, ok, StateData#st{socket=undefined}}.
 
 %% Server States
 hello(#hello_packet{} = Packet, StateData) ->
@@ -695,13 +665,13 @@ hello(#hello_packet{} = Packet, StateData) ->
                         received_nonce_counter=RN+1},
            Timeout};
         {error, _Reason} = Error ->
-          {stop, Error, StateData}
+          transition_close(Error, StateData)
       end;
     {error, _Reason} = Error ->
-      {stop, Error, StateData}
+      transition_close(Error, StateData)
   end;
-hello(_Packet, StateData) ->
-  transition_close(StateData).
+hello(timeout, StateData) ->
+  transition_close(handshake_timeout, StateData).
 
 initiate(#initiate_packet{} = Packet, StateData) ->
   #st{socket=Socket, peer_short_term_public_key=CSP,
@@ -720,16 +690,14 @@ initiate(#initiate_packet{} = Packet, StateData) ->
                                                  shared_key=SharedKey,
                                                  short_term_secret_key=SSS},
            Timeout};
-        {error, _Reason} ->
-          transition_close(StateData)
+        {error, _Reason} = Error ->
+          transition_close(Error, StateData)
       end;
-    {error, _Error} ->
-      transition_close(StateData)
+    {error, _Reason} = Error ->
+      transition_close(Error, StateData)
   end;
 initiate(timeout, StateData) ->
-  transition_close(StateData);
-initiate(_Packet, StateData) ->
-  transition_close(StateData).
+  transition_close(handshake_timeout, StateData).
 
 %% Client States
 welcome(#welcome_packet{} = Packet, StateData) ->
@@ -752,9 +720,7 @@ welcome(#welcome_packet{} = Packet, StateData) ->
       transition_close(StateData)
   end;
 welcome(timeout, StateData) ->
-  transition_close(StateData);
-welcome(_Packet, StateData) ->
-  transition_close(StateData).
+  transition_close(handshake_timeout, StateData).
 
 ready(#ready_packet{} = Packet, StateData) ->
   #st{from=From, connection_ttl=Timeout,
@@ -773,7 +739,7 @@ ready(#ready_packet{} = Packet, StateData) ->
       transition_close(StateData)
   end;
 ready(timeout, StateData) ->
-  transition_close(StateData).
+  transition_close(handshake_timeout, StateData).
 
 handle_event(Event, StateName, StateData) ->
   ok = error_logger:warning_msg("Unmatched event ~p in state ~p", [Event, StateName]),
@@ -850,17 +816,21 @@ handle_tcp(Data, StateName, StateData) ->
 
 -spec handle_tcp_closed(state_data()) -> {stop, normal, state_data()}.
 handle_tcp_closed(StateData) ->
-  {stop, normal, StateData#st{socket=undefined}}.
+  transition_close(StateData).
 
--spec transition_close(state_data()) -> {next_state, closed, state_data()}.
+-spec transition_close(state_data()) -> {stop, atom(), state_data()}.
 transition_close(StateData) ->
+  transition_close(normal, StateData).
+
+-spec transition_close(atom(), state_data()) -> {stop, atom(), state_data()}.
+transition_close(Reason, StateData) ->
   #st{socket=Socket, active=Active, controller={Controller, _}, from=From} = StateData,
   ok = gen_tcp:close(Socket),
-  ok = case Active of
-    A when A == true; A == once ->
+  ok = case {Active, From} of
+    {A, undefined} when A == true; A == once ->
       Controller ! {ecurvecp_closed, #ecurvecp_socket{pid=self()}},
       ok;
-    false ->
+    _ ->
       ok
   end,
   ok = if From /= undefined ->
@@ -869,7 +839,7 @@ transition_close(StateData) ->
     true ->
       ok
   end,
-  {next_state, closed, StateData#st{socket=undefined, from=undefined}}.
+  {stop, Reason, StateData#st{socket=undefined, from=undefined}}.
 
 -spec start_fsm() -> {ok, pid()}.
 start_fsm() ->

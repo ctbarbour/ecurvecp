@@ -1,7 +1,6 @@
 {application, ecurvecp, [
   {description, ""},
-  {vsn, "1.0.0"},
-  {id, "git"},
+  {vsn, "git"},
   {modules, []},
   {registered, []},
   {mod, {ecurvecp_app, []}},

@@ -23,10 +23,10 @@ server_handshake_test_() ->
 
 setup() ->
   ok = error_logger:tty(false),
-  ok = application:load(ecurvecp),
+  _ = application:load(ecurvecp),
   Keypair = enacl:box_keypair(),
   ok = application:set_env(ecurvecp, long_term_keypair, Keypair),
-  {ok, _Apps} = application:ensure_all_started(ecurvecp),
+  _ = application:ensure_all_started(ecurvecp),
   [{keypair, Keypair}].
 
 cleanup(_) ->

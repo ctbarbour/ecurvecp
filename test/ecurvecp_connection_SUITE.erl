@@ -22,7 +22,7 @@ init_per_suite(Config) ->
   ok = application:load(ecurvecp),
   Keypair = enacl:box_keypair(),
   ok = application:set_env(ecurvecp, long_term_keypair, Keypair),
-  {ok, _Apps} = application:ensure_all_started(ecurvecp),
+  _ = application:ensure_all_started(ecurvecp),
   Opts = [{keypair, Keypair}, {host, {127,0,0,1}}, {port, 1337}],
   Opts ++ Config.
 
