@@ -876,7 +876,8 @@ start_fsm() ->
   Controller = self(),
   ecurvecp_connection_sup:start_child([Controller]).
 
--spec process_recv_queue(state_data()) -> {next_state, established, state_data()}.
+-spec process_recv_queue(state_data())
+  -> {next_state, established, state_data(), timeout()}.
 process_recv_queue(StateData) ->
   #st{recv_queue=Queue, buffer=Buffer, socket=Socket,
       connection_ttl=Timeout} = StateData,
@@ -893,15 +894,17 @@ process_recv_queue(StateData) ->
 
 -spec verify_nonce_count(ecurvecp_packet() | short_nonce(), state_data() | integer()) -> boolean().
 verify_nonce_count(#hello_packet{nonce=N}, #st{received_nonce_counter=RC}) ->
-  verify_nonce_count(N, RC);
+  verify_nonce_bounds(N, RC);
 verify_nonce_count(#initiate_packet{nonce=N}, #st{received_nonce_counter=RC}) ->
-  verify_nonce_count(N, RC);
+  verify_nonce_bounds(N, RC);
 verify_nonce_count(#msg_packet{nonce=N}, #st{received_nonce_counter=RC}) ->
-  verify_nonce_count(N, RC);
-verify_nonce_count(<<N:64/unsigned-little-integer>>, RC) when is_integer(RC) ->
-  N > RC andalso N =< ?COUNT_LIMIT;
+  verify_nonce_bounds(N, RC);
 verify_nonce_count(_Packet, _StateData) ->
   true.
+
+-spec verify_nonce_bounds(<<_:64>>, pos_integer()) -> boolean().
+verify_nonce_bounds(<<N:64/unsigned-little-integer>>, RC) when is_integer(RC) ->
+  N > RC andalso N =< ?COUNT_LIMIT.
 
 -spec nonce_string(nonce_key(), nonce()) -> <<_:192>>.
 nonce_string(hello, <<_:8/binary>> = Nonce) ->

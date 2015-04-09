@@ -31,8 +31,7 @@ eunit: compile
 	@$(REBAR) eunit skip_deps=true
 
 ct: compile
-	ct_run -pa ./ebin -pa ./deps/*/ebin -dir ./test/ -logdir ./test/logs/
-	@open ./test/logs/index.html
+	@$(REBAR) ct skip_deps=true
 
 doc: compile
 	@$(REBAR) skip_deps=true doc
