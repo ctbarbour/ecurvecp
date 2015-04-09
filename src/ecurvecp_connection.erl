@@ -590,6 +590,7 @@ waiting({accept, LSock, Timeout}, From, StateData) ->
                                        connection_ttl=ConnectionTTL},
        HandshakeTTL};
     {error, _Reason} = Error ->
+      ok = error_logger:info_msg("Accept error ~p\n", [Error]),
       {stop, normal, Error, StateData}
   end;
 waiting({connect, Address, Port, Opts}, From, StateData) ->
@@ -651,6 +652,8 @@ established(#msg_packet{} = Packet, StateData) ->
     {error, _Reason} = Error ->
       {stop, Error, StateData}
   end;
+established(timeout, StateData) ->
+  transition_close(StateData);
 established(_Packet, StateData) ->
   {stop, badarg, StateData}.
 
@@ -875,16 +878,17 @@ start_fsm() ->
 
 -spec process_recv_queue(state_data()) -> {next_state, established, state_data()}.
 process_recv_queue(StateData) ->
-  #st{recv_queue=Queue, buffer=Buffer, socket=Socket} = StateData,
+  #st{recv_queue=Queue, buffer=Buffer, socket=Socket,
+      connection_ttl=Timeout} = StateData,
   case {queue:out(Queue), Buffer} of
     {{{value, _Receiver}, _NewQueue}, undefined} ->
       ok = inet:setopts(Socket, [{active, once}]),
-      {next_state, established, StateData};
+      {next_state, established, StateData, Timeout};
     {{{value, Receiver}, NewQueue}, Msg} ->
       _ = gen_fsm:reply(Receiver, {ok, Msg}),
       process_recv_queue(StateData#st{recv_queue=NewQueue, buffer=undefined});
     {{empty, _}, _} ->
-      {next_state, established, StateData}
+      {next_state, established, StateData, Timeout}
   end.
 
 -spec verify_nonce_count(ecurvecp_packet() | short_nonce(), state_data() | integer()) -> boolean().

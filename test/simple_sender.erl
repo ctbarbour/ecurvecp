@@ -26,8 +26,11 @@ recv(Pid) ->
   end.
 
 close(Pid) ->
-  Pid ! close,
-  ok.
+  Pid ! {close, self()},
+  receive
+    Resp ->
+      Resp
+  end.
 
 exit(Pid) ->
   Pid ! exit,
@@ -55,8 +58,8 @@ loop(Socket, F) ->
     {tcp, Socket, Data} ->
       F ! Data,
       loop(Socket, undefined);
-    close ->
-      catch gen_tcp:close(Socket),
+    {close, From} ->
+      From ! (catch gen_tcp:close(Socket)),
       loop(undefined, undefined);
     {exit, From} ->
       From ! ok,

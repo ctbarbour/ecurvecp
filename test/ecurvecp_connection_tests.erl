@@ -22,6 +22,7 @@ server_handshake_test_() ->
     fun(_) -> [?_assert(check())] end}.
 
 setup() ->
+  ok = error_logger:tty(false),
   ok = application:load(ecurvecp),
   Keypair = enacl:box_keypair(),
   ok = application:set_env(ecurvecp, long_term_keypair, Keypair),
@@ -32,48 +33,57 @@ cleanup(_) ->
   ok.
 
 check() ->
-  case proper:quickcheck(server_handshake_prop(), [{to_file, user}]) of
+  case proper:quickcheck(prop_server_handshake(), [{to_file, user}]) of
     true ->
       true;
     _Other ->
       false
   end.
 
-accept(_S) ->
-  [{hello, {call, ?MODULE, connect, [{var, sender}, {var, ip}, {var, port}]}}].
+closed(_S) ->
+  [{hello, {call, ?MODULE, connect, [{var, sender}, ?IP, ?PORT]}}].
 
 hello(S) ->
-  [{initiate, {call, ?MODULE, send_hello, [{var, sender}, S#st.sender_nonce_counter, S#st.short_term_keypair, {var, peer_pk}]}}].
+  [{initiate, {call, ?MODULE, send_hello, [{var, sender}, S#st.sender_nonce_counter, S#st.short_term_keypair, {var, peer_pk}]}},
+   {closed, {call, ?MODULE, close, [{var, sender}]}}].
 
 initiate(S) ->
-  [{established, {call, ?MODULE, send_initiate, [{var, sender}, S#st.short_term_keypair, S#st.long_term_keypair, {var, peer_pk}, S#st.sender_nonce_counter, S#st.last_msg]}}].
+  [{established, {call, ?MODULE, send_initiate, [{var, sender}, S#st.short_term_keypair, S#st.long_term_keypair, {var, peer_pk}, S#st.sender_nonce_counter, S#st.last_msg]}},
+   {closed, {call, ?MODULE, close, [{var, sender}]}}].
 
 established(S) ->
-  [{established, {call, ?MODULE, send_msg, [{var, sender}, binary(), S#st.sender_nonce_counter, S#st.peer_short_term_pk, S#st.short_term_keypair]}}].
+  [{established, {call, ?MODULE, send_msg, [{var, sender}, binary(), S#st.sender_nonce_counter, S#st.peer_short_term_pk, S#st.short_term_keypair]}},
+   {closed, {call, ?MODULE, close, [{var, sender}]}}].
 
 initial_state() ->
-  accept.
+  closed.
 
 initial_state_data() ->
   #st{sender_nonce_counter=1, long_term_keypair=enacl:box_keypair()}.
 
-next_state_data(accept, hello, S, _Sender, {call, _, _, _}) ->
+next_state_data(closed, hello, S, _Sender, {call, _, _, _}) ->
   S#st{short_term_keypair=enacl:box_keypair()};
 next_state_data(hello, initiate, S, Welcome, {call, _, _, [_, _, ShortTermKeypair, PeerPK]}) ->
   #{secret := SK} = ShortTermKeypair,
   #st{sender_nonce_counter=NC} = S,
   S#st{last_msg=Welcome, sender_nonce_counter=NC+1, peer_short_term_pk={call, ?MODULE, peer_short_term_pk, [Welcome, PeerPK, SK]}};
+next_state_data(hello, closed, S, _R, {call, _, _, _}) ->
+  S;
 next_state_data(initiate, established, S, Ready, {call, _, _, _}) ->
   #st{sender_nonce_counter=NC} = S,
   S#st{last_msg=Ready, sender_nonce_counter=NC+1};
+next_state_data(initiate, closed, S, _, {call, _, _, _}) ->
+  S;
 next_state_data(established, established, S, _Reply, {call, _, _, _}) ->
   #st{sender_nonce_counter=NC} = S,
-  S#st{sender_nonce_counter=NC+1}.
+  S#st{sender_nonce_counter=NC+1};
+next_state_data(established, closed, S, _, {call, _, _, _}) ->
+  S.
 
 precondition(_From, _To, _S, {call, _, _, _}) ->
   true.
 
-postcondition(accept, hello, _S, {call, ?MODULE, connect, [_, _, _]}, Resp) ->
+postcondition(closed, hello, _S, {call, ?MODULE, connect, [_, _, _]}, Resp) ->
   ok =:= Resp;
 postcondition(hello, initiate, _S, {call, ?MODULE, send_hello, [_, _, ShortTermKeypair, PeerPK]}, Welcome) ->
   #{secret := SK} = ShortTermKeypair,
@@ -83,6 +93,8 @@ postcondition(hello, initiate, _S, {call, ?MODULE, send_hello, [_, _, ShortTermK
     _Other ->
       false
   end;
+postcondition(hello, closed, _S, {call, ?MODULE, close, _}, R) ->
+  ok =:= R;
 postcondition(initiate, established, _S, {call, ?MODULE, send_initiate, [_, ShortKey, _LongKey, PeerPK, _NC, Welcome]}, Ready) ->
   #{secret := SK} = ShortKey,
   case decode_welcome(Welcome, PeerPK, SK) of
@@ -102,6 +114,8 @@ postcondition(initiate, established, _S, {call, ?MODULE, send_initiate, [_, Shor
     _ ->
       false
   end;
+postcondition(initiate, closed, _S, {call, ?MODULE, close, _}, R) ->
+  ok =:= R;
 postcondition(established, established, _S, {call, ?MODULE, send_msg, [_, _, _, PK, ShortKey]}, R) ->
   #{secret := SK} = ShortKey,
   case R of
@@ -115,10 +129,15 @@ postcondition(established, established, _S, {call, ?MODULE, send_msg, [_, _, _, 
       end;
     _ ->
       false
-  end.
+  end;
+postcondition(established, closed, _S, {call, ?MODULE, close, _}, R) ->
+  ok =:= R.
 
 connect(Sender, Ip, Port) ->
   simple_sender:connect(Sender, Ip, Port).
+
+close(Sender) ->
+  simple_sender:close(Sender).
 
 send_hello(Sender, NC, ShortTermKeypair, PeerKey) ->
   #{public := PK, secret := SK} = ShortTermKeypair,
@@ -172,17 +191,22 @@ do_send(Sender, Packet) ->
       {error, Error}
   end.
 
-server_handshake_prop() ->
+weight(_From, _To, {call, ?MODULE, close, _}) ->
+  1;
+weight(_From, _To, {call, ?MODULE, _, _}) ->
+  2.
+
+prop_server_handshake() ->
   #{public := PK} = application:get_env(ecurvecp, long_term_keypair, undefined),
-  {ok, LSock} = ecurvecp_connection:listen([{port, ?PORT}]),
-  _Acceptors = start_acceptors(100, LSock),
+  {ok, _Listener} = simple_listener:start_listeners(500, ?PORT),
   ?FORALL(Cmds, proper_fsm:commands(?MODULE),
           begin
             Sender = simple_sender:start(),
-            {H, S, Res} = proper_fsm:run_commands(?MODULE, Cmds, [{peer_pk, PK}, {sender, Sender}, {ip, ?IP}, {port, ?PORT}]),
+            {H, S, Res} = proper_fsm:run_commands(?MODULE, Cmds, [{peer_pk, PK}, {sender, Sender}]),
             ?WHENFAIL(
               io:format("History: ~p\nState: ~p\nResult: ~p\n", [H, S, Res]),
-              Res =:= ok)
+                aggregate(zip(proper_fsm:state_names(H), command_names(Cmds)),
+                        Res =:= ok))
           end).
 
 start_acceptors(0, _) ->
