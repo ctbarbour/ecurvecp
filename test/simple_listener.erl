@@ -1,54 +1,79 @@
 -module(simple_listener).
--export([start_listeners/2, init/3, accept/1, server_loop/1]).
+-behavior(gen_server).
 
-start_listeners(Num, Port) ->
-  Pid = spawn(?MODULE, init, [self(), Num, Port]),
-  receive
-    ok ->
-      {ok, Pid}
-  after
-    5000 ->
-      {error, timeout}
+-export([start/2, start_link/2, send/2, recv/1, close/1]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, code_change/3, terminate/2]).
+
+-record(st, {port, lsock, csock, q}).
+
+start_link(Ip, Port) ->
+  gen_server:start_link(?MODULE, [Ip, Port], []).
+
+start(Ip, Port) ->
+  gen_server:start(?MODULE, [Ip, Port], []).
+
+recv(Pid) ->
+  gen_server:call(Pid, recv).
+
+send(Pid, Data) ->
+  gen_server:call(Pid, {send, Data}).
+
+close(Pid) ->
+  gen_server:call(Pid, close).
+
+init([Ip, Port]) ->
+  case ecurvecp_connection:listen([{ip, Ip}, {port, Port}]) of
+    {ok, LSock} ->
+      {ok, #st{port=Port, lsock=LSock, q=queue:new()}, 0};
+    {error, _Reason} = Error ->
+      {stop, Error}
   end.
 
-init(Parent, Num, Port) ->
-  {ok, LSock} = ecurvecp_connection:listen([{port, Port}]),
-  Acceptors = start_acceptors(Num, LSock),
-  Parent ! ok,
-  sup_loop(LSock, Acceptors).
+handle_call(recv, From, State) ->
+  #st{csock=Sock, q=Q} = State,
+  ok = ecurvecp_connection:setopts(Sock, [{active, once}]),
+  {noreply, State#st{q=queue:in(From, Q)}};
+handle_call({send, Data}, _From, State) ->
+  #st{csock=Sock} = State,
+  {reply, ecurvecp_connection:send(Sock, Data), State};
+handle_call(close, _From, State) ->
+  {stop, normal, ok, State};
+handle_call(Msg, _From, State) ->
+  ok = error_logger:info_msg("Unmatched call ~p\n", [Msg]),
+  {stop, badarg, State}.
 
-sup_loop(LSock, Acceptors) ->
-  receive
-    {'EXIT', Acceptor, _Reason} ->
-      A = lists:delete(Acceptor, Acceptors),
-      sup_loop(LSock, [spawn(?MODULE, accept, [LSock])|A]);
-    _ ->
-      sup_loop(LSock, Acceptors)
-  end.
+handle_cast(_, State) ->
+  {noreply, State}.
 
-start_acceptors(Num, LSock) ->
-  start_acceptors(Num, LSock, []).
-
-start_acceptors(0, _, Acceptors) ->
-  Acceptors;
-start_acceptors(Num, LSock, Acceptors) ->
-  Acceptor = spawn(?MODULE, accept, [LSock]),
-  start_acceptors(Num-1, LSock, [Acceptor|Acceptors]).
-
-accept(LSock) ->
+handle_info(timeout, #st{lsock=LSock} = S) ->
   case ecurvecp_connection:accept(LSock, infinity) of
     {ok, Sock} ->
-      server_loop(Sock);
-    Error ->
-      Error
-  end.
-
-server_loop(Sock) ->
+      ok = ecurvecp_connection:setopts(Sock, [{active, once}]),
+      {noreply, S#st{csock=Sock}};
+    {error, closed} ->
+      {stop, normal, S};
+    {error, _Reason} = Error ->
+      {stop, Error, S}
+  end;
+handle_info({ecurvecp, Sock, Data}, #st{csock=Sock} = S) ->
+  #st{q=Q} = S,
+  ok = ecurvecp_connection:send(Sock, Data),
   ok = ecurvecp_connection:setopts(Sock, [{active, once}]),
-  receive
-    {ecurvecp, Sock, Data} ->
-      ok = ecurvecp_connection:send(Sock, Data),
-      server_loop(Sock);
-    Error ->
-      Error
-  end.
+  case queue:out(Q) of
+    {{value, From}, Q2} ->
+      gen_server:reply(From, Data),
+      {noreply, S#st{q=Q2}};
+    {empty, _} ->
+      {noreply, S}
+  end;
+handle_info({ecurvecp_closed, Sock}, #st{csock=Sock} = S) ->
+  {stop, normal, S};
+handle_info(Info, S) ->
+  ok = error_logger:info_msg("Unmatched info ~p\n", [Info]),
+  {stop, badarg, S}.
+
+code_change(_OldVsn, State, _Extra) ->
+  {ok, State}.
+
+terminate(_Reason, _State) ->
+  ok.

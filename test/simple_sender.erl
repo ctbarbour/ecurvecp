@@ -1,67 +1,65 @@
 -module(simple_sender).
--export([start/0, connect/3, send/2, recv/1, close/1, exit/1, init/0]).
+-behavior(gen_server).
+
+-export([start/0, start_link/0, connect/3, send/2, recv/1, close/1]).
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2, code_change/3, terminate/2]).
+
+-record(st, {sock, from}).
+
+start_link() ->
+  gen_server:start_link(?MODULE, [], []).
 
 start() ->
-  spawn_link(?MODULE, init, []).
-
-init() ->
-  loop(undefiend, undefined).
+  gen_server:start(?MODULE, [], []).
 
 connect(Pid, Ip, Port) ->
-  Pid ! {connect, Ip, Port, self()},
-  receive
-    Resp ->
-      Resp
-  end.
+  gen_server:call(Pid, {connect, Ip, Port}).
 
 send(Pid, Packet) ->
-  Pid ! {send, Packet},
-  ok.
+  gen_server:call(Pid, {send, Packet}).
 
 recv(Pid) ->
-  Pid ! {recv, self()},
-  receive
-    Data ->
-      {tcp, Data}
-  end.
+  gen_server:call(Pid, recv).
 
 close(Pid) ->
-  Pid ! {close, self()},
-  receive
-    Resp ->
-      Resp
-  end.
+  gen_server:call(Pid, close).
 
-exit(Pid) ->
-  Pid ! exit,
-  receive
-    ok ->
-      ok
-  end.
+init([]) ->
+  {ok, #st{}}.
 
-loop(Socket, F) ->
-  receive
-    {connect, Ip, Port, From} ->
-      case gen_tcp:connect(Ip, Port, [{packet, 2}, binary, {active, false}], 5000) of
-        {ok, S} ->
-          From ! ok,
-          loop(S, undefined);
-        Error ->
-          From ! Error
-      end;
-    {send, Packet} ->
-      ok = gen_tcp:send(Socket, Packet),
-      loop(Socket, F);
-    {recv, From} ->
-      ok = inet:setopts(Socket, [{active, once}]),
-      loop(Socket, From);
-    {tcp, Socket, Data} ->
-      F ! Data,
-      loop(Socket, undefined);
-    {close, From} ->
-      From ! (catch gen_tcp:close(Socket)),
-      loop(undefined, undefined);
-    {exit, From} ->
-      From ! ok,
+handle_call({connect, Ip, Port}, _From, St) ->
+  {ok, Sock} = gen_tcp:connect(Ip, Port, [{packet, 2}, binary, {active, false}], 5000),
+  {reply, ok, St#st{sock=Sock}};
+handle_call({send, Packet}, _From, #st{sock=Sock} = St) ->
+  ok = gen_tcp:send(Sock, Packet),
+  {reply, ok, St};
+handle_call(recv, From, #st{sock=Sock} = St) ->
+  ok = inet:setopts(Sock, [{active, once}]),
+  {noreply, St#st{from=From}};
+handle_call(close, _From, #st{sock=Sock} = St) ->
+  if Sock /= undefined ->
+      gen_tcp:close(Sock);
+    true ->
       ok
-  end.
+  end,
+  {stop, normal, ok, St};
+handle_call(_, _, St) ->
+  {noreply, St}.
+
+handle_cast(_, St) ->
+  {noreply, St}.
+
+handle_info({tcp, Sock, Data}, #st{sock=Sock, from=From} = St) ->
+  _ = gen_server:reply(From, Data),
+  {noreply, St#st{from=undefined}};
+handle_info({tcp_closed, Sock}, #st{sock=Sock} = St) ->
+  {stop, normal, St};
+handle_info(Info, State) ->
+  ok = error_logger:info_msg("unmatched info ~p\n", [Info]),
+  {noreply, State}.
+
+code_change(_OldVsn, St, _Extra) ->
+  {ok, St}.
+
+terminate(_Reason, _St) ->
+  ok.

@@ -564,7 +564,6 @@ waiting({accept, LSock, Timeout}, From, StateData) ->
                                        side=server},
        HandshakeTTL};
     {error, _Reason} = Error ->
-      ok = error_logger:warning_msg("Accept error ~p\n", [Error]),
       {stop, normal, Error, StateData}
   end;
 waiting({connect, Address, Port, Opts}, From, StateData) ->
@@ -668,6 +667,7 @@ hello(#hello_packet{} = Packet, StateData) ->
           transition_close(Error, StateData)
       end;
     {error, _Reason} = Error ->
+      ok = error_logger:info_msg("decode failure ~p\n", [Error]),
       transition_close(Error, StateData)
   end;
 hello(timeout, StateData) ->
