@@ -19,7 +19,7 @@ send(Pid, Packet) ->
   gen_server:call(Pid, {send, Packet}).
 
 recv(Pid) ->
-  gen_server:call(Pid, recv).
+  gen_server:call(Pid, recv, 1000).
 
 close(Pid) ->
   gen_server:call(Pid, close).

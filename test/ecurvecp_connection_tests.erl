@@ -33,7 +33,7 @@ cleanup(_) ->
   application:stop(ecurvecp).
 
 check() ->
-  case proper:quickcheck(prop_server_handshake(), [{numtests, 100}, {start_size, 5}, {to_file, user}]) of
+  case proper:quickcheck(prop_server_handshake(), [{to_file, user}]) of
     true ->
       true;
     _Other ->
@@ -91,33 +91,21 @@ postcondition(initiate, established, _S, {call, ?MODULE, send_initiate, [_, Shor
   #{secret := SK} = ShortKey,
   case decode_welcome(Welcome, PeerPK, SK) of
     {ok, SSP, _Cookie} ->
-      case Ready of
-        <<"RL3aNMXR", Nonce:8/binary, Box/binary>> ->
-          NString = <<"CurveCP-server-R", Nonce/binary>>,
-          case enacl:box_open(Box, NString, SSP, SK) of
-            {ok, _Contents} ->
-              true;
-            {error, failed_verification} ->
-              false
-          end;
-        _ ->
+      case decode_ready(Ready, SSP, SK) of
+        {ok, _} ->
+          true;
+        {error, _} ->
           false
       end;
     _ ->
       false
   end;
-postcondition(established, established, _S, {call, ?MODULE, send_msg, [_, _, _, PK, ShortKey]}, R) ->
+postcondition(established, established, _S, {call, ?MODULE, send_msg, [_, _, _, PK, ShortKey]}, Data) ->
   #{secret := SK} = ShortKey,
-  case R of
-    <<"RL3aNMXM", Nonce:8/binary, Box/binary>> ->
-      NString = <<"CurveCP-server-M", Nonce/binary>>,
-      case enacl:box_open(Box, NString, PK, SK) of
-        {ok, _Contents} ->
-          true;
-        {error, failed_verification} ->
-          false
-      end;
-    _ ->
+  case decode_msg(Data, PK, SK) of
+    {ok, _} ->
+      true;
+    {error, _} ->
       false
   end.
 
@@ -169,12 +157,7 @@ connect(Sender, Ip, Port) ->
 
 do_send(Sender, Packet) ->
   ok = simple_sender:send(Sender, Packet),
-  case simple_sender:recv(Sender) of
-    Data ->
-      Data;
-    {error, Error} ->
-      {error, Error}
-  end.
+  simple_sender:recv(Sender).
 
 weight(_From, _To, {call, ?MODULE, close, _}) ->
   1;
@@ -208,6 +191,24 @@ decode_welcome(Welcome, PK, SK) ->
       end;
     _ ->
       {error, invalid_welcome_packet}
+  end.
+
+decode_ready(Ready, SSP, SK) ->
+  case Ready of
+    <<"RL3aNMXR", Nonce:8/binary, Box/binary>> ->
+      NString = <<"CurveCP-server-R", Nonce/binary>>,
+      enacl:box_open(Box, NString, SSP, SK);
+    _ ->
+      {error, invalid_ready}
+  end.
+
+decode_msg(Data, PK, SK) ->
+  case Data of
+    <<"RL3aNMXM", Nonce:8/binary, Box/binary>> ->
+      NString = <<"CurveCP-server-M", Nonce/binary>>,
+      enacl:box_open(Box, NString, PK, SK);
+    _ ->
+      {error, invalid_msg}
   end.
 
 peer_short_term_pk(Welcome, PK, SK) ->
