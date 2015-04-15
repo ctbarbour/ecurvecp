@@ -14,6 +14,7 @@
     short_term_keypair,
     long_term_keypair,
     peer_short_term_pk,
+    peer_long_term_pk,
     last_msg
   }).
 
@@ -23,11 +24,7 @@ server_handshake_test_() ->
 
 setup() ->
   ok = error_logger:tty(false),
-  _ = application:load(ecurvecp),
-  Keypair = enacl:box_keypair(),
-  ok = application:set_env(ecurvecp, long_term_keypair, Keypair),
-  ok = application:start(ecurvecp),
-  [{keypair, Keypair}].
+  application:start(ecurvecp).
 
 cleanup(_) ->
   application:stop(ecurvecp).
@@ -44,10 +41,10 @@ waiting(_S) ->
   [{hello, {call, ?MODULE, connect, [{var, sender}, {var, ip}, {var, port}]}}].
 
 hello(S) ->
-  [{initiate, {call, ?MODULE, send_hello, [{var, sender}, S#st.sender_nonce_counter, S#st.short_term_keypair, {var, peer_pk}]}}].
+  [{initiate, {call, ?MODULE, send_hello, [{var, sender}, S#st.sender_nonce_counter, S#st.short_term_keypair, S#st.peer_long_term_pk]}}].
 
 initiate(S) ->
-  [{established, {call, ?MODULE, send_initiate, [{var, sender}, S#st.short_term_keypair, S#st.long_term_keypair, {var, peer_pk}, S#st.sender_nonce_counter, S#st.last_msg]}}].
+  [{established, {call, ?MODULE, send_initiate, [{var, sender}, S#st.short_term_keypair, S#st.long_term_keypair, S#st.peer_long_term_pk,  S#st.sender_nonce_counter, S#st.last_msg]}}].
 
 established(S) ->
   [{established, {call, ?MODULE, send_msg, [{var, sender}, binary(), S#st.sender_nonce_counter, S#st.peer_short_term_pk, S#st.short_term_keypair]}}].
@@ -58,7 +55,8 @@ initial_state() ->
 initial_state_data() ->
   #st{sender_nonce_counter=1,
       short_term_keypair=enacl:box_keypair(),
-      long_term_keypair=enacl:box_keypair()}.
+      long_term_keypair=enacl:box_keypair(),
+      peer_long_term_pk=ecurvecp_vault:public_key()}.
 
 next_state_data(waiting, hello, S, _R, _) ->
   S;
@@ -165,13 +163,12 @@ weight(_From, _To, {call, ?MODULE, _, _}) ->
   2.
 
 prop_server_handshake() ->
-  #{public := PK} = application:get_env(ecurvecp, long_term_keypair, undefined),
   ?FORALL({Cmds, Port}, {proper_fsm:commands(?MODULE), choose(1024, 41915)},
           ?TRAPEXIT(
             begin
               {ok, Listener} = simple_listener:start(?IP, Port),
               {ok, Sender} = simple_sender:start(),
-              {H, S, Res} = proper_fsm:run_commands(?MODULE, Cmds, [{peer_pk, PK}, {ip, ?IP}, {port, Port}, {sender, Sender}, {listener, Listener}]),
+              {H, S, Res} = proper_fsm:run_commands(?MODULE, Cmds, [{ip, ?IP}, {port, Port}, {sender, Sender}, {listener, Listener}]),
               ok = simple_sender:close(Sender),
               ?WHENFAIL(
                 io:format("History: ~p\nState: ~p\nResult: ~p\n", [H, S, Res]),
