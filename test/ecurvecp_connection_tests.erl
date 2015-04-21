@@ -20,7 +20,9 @@
   }).
 
 server_handshake_test_() ->
-   {setup, fun setup/0, fun cleanup/1,
+   {setup,
+    fun setup/0,
+    fun cleanup/1,
     fun(_) -> [?_assert(check())] end}.
 
 setup() ->
@@ -31,18 +33,13 @@ cleanup(_) ->
   application:stop(ecurvecp).
 
 check() ->
-  case proper:quickcheck(prop_server_handshake(), [{numtests, 100}, {start_size, 5}, {to_file, user}]) of
-    true ->
-      true;
-    _Other ->
-      false
-  end.
+  proper:quickcheck(prop_server_handshake(), [{numtests, 100}, {start_size, 5}, {to_file, user}]).
 
 initial_state() ->
   waiting.
 
 initial_state_data() ->
-  #st{c=1, rc=0, short_term_keypair=g_keypair(), long_term_keypair=g_keypair()}.
+  #st{c=1, rc=0, short_term_keypair=g_keypair(), long_term_keypair=g_keypair(), peer_long_term_pk=ecurvecp_vault:public_key()}.
 
 waiting(_S) ->
   [{hello, {call, ?MODULE, connect, [{var, sender}, {var, ip}, {var, port}]}}].
@@ -57,7 +54,7 @@ established(S) ->
   [{established, {call, ?MODULE, send_msg, [{var, sender}, binary(), S#st.c, S#st.peer_short_term_pk, S#st.short_term_keypair]}}].
 
 next_state_data(waiting, hello, S, _R, _) ->
-  S#st{peer_long_term_pk=ecurvecp_vault:public_key()};
+  S;
 next_state_data(hello, closed, S, _, _) ->
   S;
 next_state_data(hello, initiate, S, Welcome, {call, ?MODULE, send_hello, [_Sender, _Hello]}) ->
