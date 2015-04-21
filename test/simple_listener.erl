@@ -51,6 +51,7 @@ handle_info(timeout, #st{lsock=LSock} = S) ->
       ok = ecurvecp_connection:setopts(Sock, [{active, once}]),
       {noreply, S#st{csock=Sock}};
     {error, closed} ->
+      ok = error_logger:error_msg("Handshake closed"),
       {stop, normal, S};
     {error, _Reason} = Error ->
       {stop, Error, S}
@@ -66,8 +67,14 @@ handle_info({ecurvecp, Sock, Data}, #st{csock=Sock} = S) ->
     {empty, _} ->
       {noreply, S}
   end;
-handle_info({ecurvecp_closed, Sock}, #st{csock=Sock} = S) ->
-  {stop, normal, S};
+handle_info({ecurvecp_closed, Sock}, #st{csock=Sock, q=Q} = S) ->
+  case queue:out(Q) of
+    {{value, From}, Q2} ->
+      gen_server:reply(From, {error, closed}),
+      {stop, normal, S#st{q=Q2}};
+    {empty, _} ->
+      {stop, normal, S}
+  end;
 handle_info(Info, S) ->
   ok = error_logger:info_msg("Unmatched info ~p\n", [Info]),
   {stop, badarg, S}.

@@ -26,7 +26,7 @@ server_handshake_test_() ->
     fun(_) -> [?_assert(check())] end}.
 
 setup() ->
-  ok = error_logger:tty(false),
+  %ok = error_logger:tty(false),
   application:start(ecurvecp).
 
 cleanup(_) ->
@@ -44,8 +44,12 @@ initial_state_data() ->
 waiting(_S) ->
   [{hello, {call, ?MODULE, connect, [{var, sender}, {var, ip}, {var, port}]}}].
 
+closed(_S) ->
+  [{hello, {call, ?MODULE, connect, [{var, sender}, {var, ip}, {var, port}]}}].
+
 hello(S) ->
-  [{initiate, {call, ?MODULE, send_hello, [{var, sender}, g_hello_good(S)]}}].
+  [{initiate, {call, ?MODULE, send_hello_good, [{var, sender}, g_hello_good(S)]}},
+   {closed, {call, ?MODULE, send_hello_bad, [{var, sender}, g_hello_bad(S)]}}].
 
 initiate(S) ->
   [{established, {call, ?MODULE, send_initiate, [{var, sender}, S#st.short_term_keypair, S#st.long_term_keypair, S#st.peer_long_term_pk,  S#st.c, S#st.last_msg]}}].
@@ -55,13 +59,11 @@ established(S) ->
 
 next_state_data(waiting, hello, S, _R, _) ->
   S;
+next_state_data(closed, hello, S, _R, _) ->
+  S;
 next_state_data(hello, closed, S, _, _) ->
   S;
-next_state_data(hello, initiate, S, Welcome, {call, ?MODULE, send_hello, [_Sender, _Hello]}) ->
-  #st{c=C} = S,
-  PeerShortTermKey = {call, ?MODULE, peer_short_term_pk, [Welcome, S#st.peer_long_term_pk, S#st.short_term_keypair]},
-  S#st{last_msg=Welcome, c=C+1, peer_short_term_pk=PeerShortTermKey};
-next_state_data(hello, initiate, S, Welcome, {call, ?MODULE, send_hello, [_Sender, _ShortTermKeypair, _, _, _, _, _]}) ->
+next_state_data(hello, initiate, S, Welcome, {call, ?MODULE, send_hello_good, [_Sender, _Hello]}) ->
   #st{c=C} = S,
   PeerShortTermKey = {call, ?MODULE, peer_short_term_pk, [Welcome, S#st.peer_long_term_pk, S#st.short_term_keypair]},
   S#st{last_msg=Welcome, c=C+1, peer_short_term_pk=PeerShortTermKey};
@@ -77,30 +79,16 @@ precondition(_From, _To, _S, {call, _, _, _}) ->
 
 postcondition(waiting, hello, _S, {call, ?MODULE, connect, _}, R) ->
   R =:= ok;
-postcondition(hello, initiate, S, {call, ?MODULE, send_hello, [_Sender, _Hello]}, Welcome) ->
+postcondition(hello, initiate, S, {call, ?MODULE, send_hello_good, [_Sender, _Hello]}, Welcome) ->
   case decode_welcome(Welcome, S#st.peer_long_term_pk, S#st.short_term_keypair) of
     {ok, _, _} ->
       true;
     _Other ->
       false
   end;
-postcondition(hello, initiate, S, {call, ?MODULE, send_hello, [_Sender, ShortTermKeypair, PeerPK, _, _, _, _]}, Welcome) ->
-  {_, SK} = ShortTermKeypair,
-  ?debugFmt("State: ~p\nLocal: ~p\n", [S#st.short_term_keypair, ShortTermKeypair]),
-  case decode_welcome(Welcome, PeerPK, SK) of
-    {ok, _, _} ->
-      true;
-    _Other ->
-      false
-  end;
-postcondition(hello, initiate, _S, {call, ?MODULE, send_hello, [_, _, ShortTermKeypair, PeerPK]}, Welcome) ->
-  {_, SK} = ShortTermKeypair,
-  case decode_welcome(Welcome, PeerPK, SK) of
-    {ok, _, _} ->
-      true;
-    _Other ->
-      false
-  end;
+postcondition(hello, closed, _S, {call, ?MODULE, send_hello_bad, [_Sender, _Hello]}, {error, closed} = R) ->
+  ?debugFmt("Hello -> Closed. ~p\n", [R]),
+  true;
 postcondition(initiate, established, S, {call, ?MODULE, send_initiate, [_, ShortKey, _LongKey, PeerPK, _NC, Welcome]}, Ready) ->
   {_, SK} = ShortKey,
   case decode_welcome(Welcome, PeerPK, SK) of
@@ -135,8 +123,8 @@ g_padding_bad() ->
 g_padding(S) ->
   ?LET(Pad, vector(S, <<0>>), list_to_binary(Pad)).
 
-g_hello_bad(_, _, _) ->
-  exactly(bad_hello).
+g_hello_bad(_S) ->
+  exactly(<<"BadHello">>).
 
 g_hello_prefix() ->
   exactly(<<"QvnQ5XlH">>).
@@ -180,31 +168,11 @@ g_keypair() ->
   #{public := PK, secret := SK} = enacl:box_keypair(),
   {PK, SK}.
 
-encode_hello(PeerKey, PeerPK, NC) ->
-  {PK, SK} = PeerKey,
-  Zeros = binary:copy(<<0>>, 64),
-  Nonce = <<NC:64/unsigned-little-integer>>,
-  NString = <<"CurveCP-client-H", Nonce/binary>>,
-  Box = enacl:box(Zeros, NString, PeerPK, SK),
-  <<"QvnQ5XlH", 1/integer, 0/integer, Zeros/binary, PK/binary, Nonce/binary, Box/binary>>.
-
-send_hello(Sender, Hello) ->
+send_hello_good(Sender, Hello) ->
   do_send(Sender, Hello).
 
-send_hello(Sender, {PK, SK}, PeerPK, Prefix, Version, Padding, Nonce) ->
-  NString = <<"CurveCP-client-H", Nonce/binary>>,
-  Box = enacl:box(Padding, NString, PeerPK, SK),
-  Packet = <<Prefix/binary, Version/binary, Padding/binary, PK/binary, Nonce/binary, Box/binary>>,
-  do_send(Sender, Packet).
-
-send_hello(Sender, NC, ShortTermKeypair, PeerKey) ->
-  {PK, SK} = ShortTermKeypair,
-  Zeros = binary:copy(<<0>>, 64),
-  Nonce = <<NC:64/unsigned-little-integer>>,
-  NString = <<"CurveCP-client-H", Nonce/binary>>,
-  Box = enacl:box(Zeros, NString, PeerKey, SK),
-  Packet = <<"QvnQ5XlH", 1/integer, 0/integer, Zeros/binary, PK/binary, Nonce/binary, Box/binary>>,
-  do_send(Sender, Packet).
+send_hello_bad(Sender, BadHello) ->
+  do_send(Sender, BadHello).
 
 send_initiate(Sender, ShortKey, LongKey, PeerPK, NC, Welcome) ->
   {LP, LS} = LongKey,

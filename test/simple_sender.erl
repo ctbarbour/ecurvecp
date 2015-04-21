@@ -22,7 +22,12 @@ recv(Pid) ->
   gen_server:call(Pid, recv, 1000).
 
 close(Pid) ->
-  gen_server:call(Pid, close).
+  try
+    gen_server:call(Pid, close)
+  catch
+    exit:{noproc, _} ->
+      ok
+  end.
 
 init([]) ->
   {ok, #st{}}.
@@ -52,7 +57,12 @@ handle_cast(_, St) ->
 handle_info({tcp, Sock, Data}, #st{sock=Sock, from=From} = St) ->
   _ = gen_server:reply(From, Data),
   {noreply, St#st{from=undefined}};
-handle_info({tcp_closed, Sock}, #st{sock=Sock} = St) ->
+handle_info({tcp_closed, Sock}, #st{sock=Sock, from=From} = St) ->
+  if From /= undefined ->
+      _ = gen_server:reply(From, {error, closed});
+    true ->
+      ok
+  end,
   {stop, normal, St};
 handle_info(Info, State) ->
   ok = error_logger:info_msg("unmatched info ~p\n", [Info]),
