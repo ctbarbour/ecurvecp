@@ -36,16 +36,13 @@ check() ->
   proper:quickcheck(prop_server_handshake(), [{numtests, 100}, {start_size, 5}, {to_file, user}]).
 
 initial_state() ->
-  waiting.
+  closed.
 
 initial_state_data() ->
   #st{c=1, rc=0, short_term_keypair=g_keypair(), long_term_keypair=g_keypair(), peer_long_term_pk=ecurvecp_vault:public_key()}.
 
-waiting(_S) ->
-  [{hello, {call, ?MODULE, connect, [{var, sender}, {var, ip}, {var, port}]}}].
-
 closed(_S) ->
-  [{hello, {call, ?MODULE, connect, [{var, sender}, {var, ip}, {var, port}]}}].
+  [{hello, {call, ?MODULE, connect, [{var, listener}, {var, sender}, {var, ip}, {var, port}]}}].
 
 hello(S) ->
   [{initiate, {call, ?MODULE, send_hello_good, [{var, sender}, g_hello_good(S)]}},
@@ -57,9 +54,7 @@ initiate(S) ->
 established(S) ->
   [{established, {call, ?MODULE, send_msg, [{var, sender}, binary(), S#st.c, S#st.peer_short_term_pk, S#st.short_term_keypair]}}].
 
-next_state_data(waiting, hello, S, _R, _) ->
-  S;
-next_state_data(closed, hello, S, _R, _) ->
+next_state_data(closed, hello, S, _Acceptor, {call, ?MODULE, connect, _}) ->
   S;
 next_state_data(hello, closed, S, _, _) ->
   S;
@@ -77,8 +72,8 @@ next_state_data(established, established, S, _Reply, {call, _, _, _}) ->
 precondition(_From, _To, _S, {call, _, _, _}) ->
   true.
 
-postcondition(waiting, hello, _S, {call, ?MODULE, connect, _}, R) ->
-  R =:= ok;
+postcondition(closed, hello, _S, {call, ?MODULE, connect, _}, _R) ->
+  true;
 postcondition(hello, initiate, S, {call, ?MODULE, send_hello_good, [_Sender, _Hello]}, Welcome) ->
   case decode_welcome(Welcome, S#st.peer_long_term_pk, S#st.short_term_keypair) of
     {ok, _, _} ->
@@ -86,8 +81,7 @@ postcondition(hello, initiate, S, {call, ?MODULE, send_hello_good, [_Sender, _He
     _Other ->
       false
   end;
-postcondition(hello, closed, _S, {call, ?MODULE, send_hello_bad, [_Sender, _Hello]}, {error, closed} = R) ->
-  ?debugFmt("Hello -> Closed. ~p\n", [R]),
+postcondition(hello, closed, _S, {call, ?MODULE, send_hello_bad, [_Sender, _Hello]}, {error, closed}) ->
   true;
 postcondition(initiate, established, S, {call, ?MODULE, send_initiate, [_, ShortKey, _LongKey, PeerPK, _NC, Welcome]}, Ready) ->
   {_, SK} = ShortKey,
@@ -208,8 +202,10 @@ send_msg(Sender, Msg, NC, PK, Keypair) ->
   Packet = <<"RL3aNMXM", Nonce/binary, Box/binary>>,
   do_send(Sender, Packet).
 
-connect(Sender, Ip, Port) ->
-  simple_sender:connect(Sender, Ip, Port).
+connect(Listener, Sender, Ip, Port) ->
+  {ok, Acceptor} = simple_listener:acceptor(Listener),
+  ok = simple_sender:connect(Sender, Ip, Port),
+  Acceptor.
 
 do_send(Sender, Packet) ->
   ok = simple_sender:send(Sender, Packet),
@@ -219,14 +215,14 @@ weight(_From, _To, _) ->
   1.
 
 prop_server_handshake() ->
+  {ok, Listener} = simple_listener:start(?IP, ?PORT),
   ?FORALL(State, g_initial_state(),
-    ?FORALL({Cmds, Port, ShortTermKeypair, LongTermKeypair},
-            {proper_fsm:commands(?MODULE, State), choose(1024, 41915), g_keypair(), g_keypair()},
+    ?FORALL({Cmds, ShortTermKeypair, LongTermKeypair},
+            {proper_fsm:commands(?MODULE, State), g_keypair(), g_keypair()},
             ?TRAPEXIT(
               begin
-                {ok, Listener} = simple_listener:start(?IP, Port),
                 {ok, Sender} = simple_sender:start(),
-                {H, S, Res} = proper_fsm:run_commands(?MODULE, Cmds, [{ip, ?IP}, {port, Port}, {sender, Sender}, {listener, Listener}, {short_term_keypair, ShortTermKeypair}, {long_term_keypair, LongTermKeypair}]),
+                {H, S, Res} = proper_fsm:run_commands(?MODULE, Cmds, [{ip, ?IP}, {port, ?PORT}, {sender, Sender}, {listener, Listener}, {short_term_keypair, ShortTermKeypair}, {long_term_keypair, LongTermKeypair}]),
                 ok = simple_sender:close(Sender),
                 ?WHENFAIL(
                   io:format("History: ~p\nState: ~p\nResult: ~p\n", [H, S, Res]),

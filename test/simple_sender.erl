@@ -63,7 +63,7 @@ handle_info({tcp_closed, Sock}, #st{sock=Sock, from=From} = St) ->
     true ->
       ok
   end,
-  {stop, normal, St};
+  {noreply, St#st{sock=undefined}};
 handle_info(Info, State) ->
   ok = error_logger:info_msg("unmatched info ~p\n", [Info]),
   {noreply, State}.
