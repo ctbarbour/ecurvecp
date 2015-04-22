@@ -16,17 +16,20 @@
     long_term_keypair,
     peer_short_term_pk,
     peer_long_term_pk,
+    acceptor,
     last_msg
   }).
 
 server_handshake_test_() ->
-   {setup,
-    fun setup/0,
-    fun cleanup/1,
-    fun(_) -> [?_assert(check())] end}.
+   {timeout, 60,
+    {setup,
+      fun setup/0,
+      fun cleanup/1,
+      fun(_) -> [?_assert(check())] end}
+   }.
 
 setup() ->
-  %ok = error_logger:tty(false),
+  ok = error_logger:tty(false),
   application:start(ecurvecp).
 
 cleanup(_) ->
@@ -54,8 +57,8 @@ initiate(S) ->
 established(S) ->
   [{established, {call, ?MODULE, send_msg, [{var, sender}, binary(), S#st.c, S#st.peer_short_term_pk, S#st.short_term_keypair]}}].
 
-next_state_data(closed, hello, S, _Acceptor, {call, ?MODULE, connect, _}) ->
-  S;
+next_state_data(closed, hello, S, Acceptor, {call, ?MODULE, connect, _}) ->
+  S#st{acceptor=Acceptor};
 next_state_data(hello, closed, S, _, _) ->
   S;
 next_state_data(hello, initiate, S, Welcome, {call, ?MODULE, send_hello_good, [_Sender, _Hello]}) ->
@@ -81,8 +84,10 @@ postcondition(hello, initiate, S, {call, ?MODULE, send_hello_good, [_Sender, _He
     _Other ->
       false
   end;
-postcondition(hello, closed, _S, {call, ?MODULE, send_hello_bad, [_Sender, _Hello]}, {error, closed}) ->
+postcondition(hello, closed, _S, {call, ?MODULE, send_hello_bad, [_Sender, _BadHello]}, {error, closed}) ->
   true;
+postcondition(hello, closed, _S, {call, ?MODULE, send_hello_bad, [_Sender, _BadHello]}, _R) ->
+  false;
 postcondition(initiate, established, S, {call, ?MODULE, send_initiate, [_, ShortKey, _LongKey, PeerPK, _NC, Welcome]}, Ready) ->
   {_, SK} = ShortKey,
   case decode_welcome(Welcome, PeerPK, SK) of
@@ -117,11 +122,11 @@ g_padding_bad() ->
 g_padding(S) ->
   ?LET(Pad, vector(S, <<0>>), list_to_binary(Pad)).
 
-g_hello_bad(_S) ->
-  exactly(<<"BadHello">>).
-
-g_hello_prefix() ->
+g_hello_prefix_good() ->
   exactly(<<"QvnQ5XlH">>).
+
+g_hello_prefix_bad() ->
+  binary(8).
 
 g_version_good() ->
   exactly(<<1/integer, 0/integer>>).
@@ -136,26 +141,37 @@ g_short_nonce_good(NC) ->
   <<NC:64/unsigned-little-integer>>.
 
 g_short_nonce_bad(NC) ->
-  ?LET({Type, Size},
-       {oneof([little, big]), ?SUCHTHAT(N, integer(0, inf), N /= NC), ?SUCHTHAT(I, integer(8, inf), I /= 64 andalso I rem 8 == 0)},
+  ?LET({Type, C},
+       {oneof([little, big]), ?SUCHTHAT(N, integer(0, inf), N /= NC)},
        begin
          case Type of
            little ->
-             <<NC:Size/unsigned-little-integer>>;
+             <<C:64/unsigned-little-integer>>;
            big ->
-             <<NC:Size/unsigned-big-integer>>
+             <<C:64/unsigned-big-integer>>
          end
       end).
 
 g_hello_good(#st{short_term_keypair={PK, SK}, peer_long_term_pk=PeerPK, c=NC}) ->
   ?LET({Prefix, Version, Zeros, Nonce},
-       {g_hello_prefix(), g_version_good(), g_padding_good(), g_short_nonce_good(NC)},
+       {g_hello_prefix_good(), g_version_good(), g_padding_good(), g_short_nonce_good(NC)},
        begin
           ?LET(NString, g_hello_nonce_string(Nonce),
                begin
                  Box = enacl:box(Zeros, NString, PeerPK, SK),
                  <<Prefix/binary, Version/binary, Zeros/binary, PK/binary, Nonce/binary, Box/binary>>
                end)
+       end).
+
+g_hello_bad(#st{short_term_keypair={PK, SK}, peer_long_term_pk=PeerPK, c=NC}) ->
+  ?LET({Prefix, Version, Padding, Nonce},
+       {g_hello_prefix_bad(), g_version_bad(), g_padding_bad(), g_short_nonce_bad(NC)},
+       begin
+         ?LET(NString, g_hello_nonce_string(Nonce),
+              begin
+                Box = enacl:box(Padding, NString, PeerPK, SK),
+                <<Prefix/binary, Version/binary, Padding/binary, PK/binary, Nonce/binary, Box/binary>>
+              end)
        end).
 
 g_keypair() ->
