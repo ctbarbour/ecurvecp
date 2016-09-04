@@ -207,7 +207,7 @@ g_vouch_nonce_string_good(Nonce) ->
 
 g_vouch_nonce_string_bad(Nonce) ->
   ?LET(Prefix,
-       ?SUCHTHAT(P, binary(8) P /= <<"CurveCPV">>),
+       ?SUCHTHAT(P, binary(8), P /= <<"CurveCPV">>),
        <<Prefix/binary, Nonce/binary>>).
 
 g_initiate_nonce_string_good(Nonce) ->
@@ -215,7 +215,7 @@ g_initiate_nonce_string_good(Nonce) ->
 
 g_initiate_nonce_string_bad(Nonce) ->
   ?LET(Prefix,
-       ?SUCHTHAT(P, binary(16) P /= <<"CurveCP-client-I">>),
+       ?SUCHTHAT(P, binary(16), P /= <<"CurveCP-client-I">>),
        <<Prefix/binary, Nonce/binary>>).
 
 g_hello_bad(#st{short_term_keypair={PK, SK}, peer_long_term_pk=PeerPK, c=NC}) ->
