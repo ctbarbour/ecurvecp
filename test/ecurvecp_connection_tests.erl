@@ -14,10 +14,10 @@
     rc,
     short_term_keypair,
     long_term_keypair,
-    peer_short_term_pk,
     peer_long_term_pk,
-    acceptor,
-    last_msg
+    peer_short_term_pk,
+    cookie,
+    acceptor
   }).
 
 server_handshake_test_() ->
@@ -36,7 +36,7 @@ cleanup(_) ->
   application:stop(ecurvecp).
 
 check() ->
-  proper:quickcheck(prop_server_handshake(), [{numtests, 100}, {start_size, 5}, {to_file, user}]).
+  proper:quickcheck(prop_server_handshake(), [{numtests, 200}, {start_size, 5}, {to_file, user}]).
 
 initial_state() ->
   closed.
@@ -52,25 +52,23 @@ hello(S) ->
    {closed, {call, ?MODULE, send_hello_bad, [{var, sender}, g_hello_bad(S)]}}].
 
 initiate(S) ->
-  [{established, {call, ?MODULE, send_initiate, [{var, sender}, S#st.short_term_keypair, S#st.long_term_keypair, S#st.peer_long_term_pk,  S#st.c, S#st.last_msg]}}].
+  [{established, {call, ?MODULE, send_initiate_good, [{var, sender}, g_initiate_good(S)]}}].
 
 established(S) ->
   [{established, {call, ?MODULE, send_msg, [{var, sender}, binary(), S#st.c, S#st.peer_short_term_pk, S#st.short_term_keypair]}}].
 
 next_state_data(closed, hello, S, Acceptor, {call, ?MODULE, connect, _}) ->
   S#st{acceptor=Acceptor};
-next_state_data(hello, closed, S, _, _) ->
-  S;
 next_state_data(hello, initiate, S, Welcome, {call, ?MODULE, send_hello_good, [_Sender, _Hello]}) ->
-  #st{c=C} = S,
-  PeerShortTermKey = {call, ?MODULE, peer_short_term_pk, [Welcome, S#st.peer_long_term_pk, S#st.short_term_keypair]},
-  S#st{last_msg=Welcome, c=C+1, peer_short_term_pk=PeerShortTermKey};
-next_state_data(initiate, established, S, Ready, {call, _, _, _}) ->
-  #st{c=C, rc=RC} = S,
-  S#st{last_msg=Ready, c=C+1, rc=RC+1};
+  PeerShortTermPK = {'call', ?MODULE, peer_short_term_pk, [Welcome, S#st.peer_long_term_pk, S#st.short_term_keypair]},
+  Cookie = {'call', ?MODULE, extract_cookie, [Welcome, S#st.peer_long_term_pk, S#st.short_term_keypair]},
+  S#st{c=S#st.c+1, peer_short_term_pk=PeerShortTermPK, cookie=Cookie};
+next_state_data(initiate, established, S, _Ready, {call, ?MODULE, send_initiate_good, _}) ->
+  S#st{c=S#st.c+1, rc=S#st.rc+1};
 next_state_data(established, established, S, _Reply, {call, _, _, _}) ->
-  #st{c=C} = S,
-  S#st{c=C+1}.
+  S#st{c=S#st.c+1, rc=S#st.rc+1};
+next_state_data(_, closed, S, _R, _C) ->
+  S#st{acceptor=undefined, c=1, rc=0}.
 
 precondition(_From, _To, _S, {call, _, _, _}) ->
   true.
@@ -87,6 +85,17 @@ postcondition(hello, initiate, S, {call, ?MODULE, send_hello_good, [_Sender, _He
 postcondition(hello, closed, _S, {call, ?MODULE, send_hello_bad, [_Sender, _BadHello]}, {error, closed}) ->
   true;
 postcondition(hello, closed, _S, {call, ?MODULE, send_hello_bad, [_Sender, _BadHello]}, _R) ->
+  false;
+postcondition(initiate, established, S, {call, ?MODULE, send_initiate_good, [_Sender, _Initiate]}, Ready) ->
+  case decode_ready(Ready, S) of
+    {ok, N, _} ->
+      N > S#st.rc;
+    {error, _} ->
+      false
+  end;
+postcondition(initiate, closed, _S, {call, ?MODULE, send_initiate_bad, [_Sender, _Initiate]}, {error, closed}) ->
+  true;
+postcondition(initiate, closed, _S, {call, ?MODULE, send_initiate_bad, [_Sender, _Initiate]}, _R) ->
   false;
 postcondition(initiate, established, S, {call, ?MODULE, send_initiate, [_, ShortKey, _LongKey, PeerPK, _NC, Welcome]}, Ready) ->
   {_, SK} = ShortKey,
@@ -163,6 +172,52 @@ g_hello_good(#st{short_term_keypair={PK, SK}, peer_long_term_pk=PeerPK, c=NC}) -
                end)
        end).
 
+g_initiate_good(#st{short_term_keypair={SP, SS}, long_term_keypair={LP, LS}, peer_long_term_pk=PeerPK, peer_short_term_pk=SSP, cookie=Cookie, c=NC}) ->
+  ?LET({Prefix, Kookie, Nonce, Vouch},
+       {g_initiate_prefix_good(), exactly(Cookie), g_short_nonce_good(NC), g_vouch_good(SP, PeerPK, SSP, LS)},
+       begin
+         ?LET(NString, g_initiate_nonce_string_good(Nonce),
+              begin
+                ?debugFmt("Cookie: ~p\n", [Cookie]),
+                Box = enacl:box(<<LP/binary, Vouch/binary, 0/integer>>, NString, SSP, SS),
+                <<Prefix/binary, Kookie/binary, Nonce/binary, Box/binary>>
+              end)
+    end).
+
+g_initiate_bad(_S) ->
+  exactly(<<"badInitiate">>).
+
+g_initiate_prefix_good() ->
+  exactly(<<"QvnQ5XlI">>).
+
+g_vouch_good(SP, PeerPK, SSP, LS) ->
+  ?LET(Nonce, binary(16),
+       begin
+         ?LET(NString, g_vouch_nonce_string_good(Nonce),
+              begin
+                ?debugFmt("SSP: ~p\n", [SSP]),
+                ?debugFmt("SSP eval: ~p\n", [eval(SSP)]),
+                Box = enacl:box(<<SP/binary, PeerPK/binary>>, NString, SSP, LS),
+                <<Nonce/binary, Box/binary>>
+              end)
+    end).
+
+g_vouch_nonce_string_good(Nonce) ->
+  exactly(<<"CurveCPV", Nonce/binary>>).
+
+g_vouch_nonce_string_bad(Nonce) ->
+  ?LET(Prefix,
+       ?SUCHTHAT(P, binary(8) P /= <<"CurveCPV">>),
+       <<Prefix/binary, Nonce/binary>>).
+
+g_initiate_nonce_string_good(Nonce) ->
+  exactly(<<"CurveCP-client-I", Nonce/binary>>).
+
+g_initiate_nonce_string_bad(Nonce) ->
+  ?LET(Prefix,
+       ?SUCHTHAT(P, binary(16) P /= <<"CurveCP-client-I">>),
+       <<Prefix/binary, Nonce/binary>>).
+
 g_hello_bad(#st{short_term_keypair={PK, SK}, peer_long_term_pk=PeerPK, c=NC}) ->
   ?LET({Prefix, Version, Padding, Nonce},
        {g_hello_prefix_bad(), g_version_bad(), g_padding_bad(), g_short_nonce_bad(NC)},
@@ -183,6 +238,12 @@ send_hello_good(Sender, Hello) ->
 
 send_hello_bad(Sender, BadHello) ->
   do_send(Sender, BadHello).
+
+send_initiate_good(Sender, Initiate) ->
+  do_send(Sender, Initiate).
+
+send_initiate_bad(Sender, BadInitiate) ->
+  do_send(Sender, BadInitiate).
 
 send_initiate(Sender, ShortKey, LongKey, PeerPK, NC, Welcome) ->
   {LP, LS} = LongKey,
@@ -227,23 +288,19 @@ do_send(Sender, Packet) ->
   ok = simple_sender:send(Sender, Packet),
   simple_sender:recv(Sender).
 
-weight(_From, _To, _) ->
-  1.
-
 prop_server_handshake() ->
   {ok, Listener} = simple_listener:start(?IP, ?PORT),
   ?FORALL(State, g_initial_state(),
-    ?FORALL({Cmds, ShortTermKeypair, LongTermKeypair},
-            {proper_fsm:commands(?MODULE, State), g_keypair(), g_keypair()},
-            ?TRAPEXIT(
-              begin
-                {ok, Sender} = simple_sender:start(),
-                {H, S, Res} = proper_fsm:run_commands(?MODULE, Cmds, [{ip, ?IP}, {port, ?PORT}, {sender, Sender}, {listener, Listener}, {short_term_keypair, ShortTermKeypair}, {long_term_keypair, LongTermKeypair}]),
-                ok = simple_sender:close(Sender),
-                ?WHENFAIL(
-                  io:format("History: ~p\nState: ~p\nResult: ~p\n", [H, S, Res]),
-                    aggregate(zip(proper_fsm:state_names(H), command_names(Cmds)),
-                            Res =:= ok))
+    ?FORALL(Cmds, proper_fsm:commands(?MODULE, State),
+      ?TRAPEXIT(
+        begin
+          {ok, Sender} = simple_sender:start(),
+          {H, S, Res} = proper_fsm:run_commands(?MODULE, Cmds, [{ip, ?IP}, {port, ?PORT}, {sender, Sender}, {listener, Listener}]),
+          ok = simple_sender:close(Sender),
+          ?WHENFAIL(
+            io:format("History: ~p\nState: ~p\nResult: ~p\n", [H, S, Res]),
+                      aggregate(zip(proper_fsm:state_names(H), command_names(Cmds)),
+                      Res == ok))
         end))).
 
 decode_welcome(Welcome, PK, {_, SK}) ->
@@ -260,6 +317,21 @@ decode_welcome(Welcome, PK, SK) ->
       end;
     _ ->
       {error, invalid_welcome_packet}
+  end.
+
+decode_ready(Ready, #st{peer_short_term_pk=SSP, short_term_keypair={_, SK}}) ->
+  case Ready of
+    <<"RL3aNMXR", Nonce:8/binary, Box/binary>> ->
+      NString = <<"CurveCP-server-R", Nonce/binary>>,
+      <<N:64/unsigned-little-integer>> = Nonce,
+      case enacl:box_open(Box, NString, SSP, SK) of
+        {ok, Contents} ->
+          {ok, N, Contents};
+        {error, failed_verification} ->
+          {error, failed_verification}
+      end;
+    _ ->
+      {error, invalid_ready}
   end.
 
 decode_ready(Ready, SSP, SK) ->
@@ -290,6 +362,14 @@ decode_msg(Data, PK, SK) ->
       end;
     _ ->
       {error, invalid_msg}
+  end.
+
+extract_cookie(Welcome, PK, {_, SK}) ->
+  case decode_welcome(Welcome, PK, SK) of
+    {ok, _, Cookie} ->
+      Cookie;
+    Error ->
+      Error
   end.
 
 peer_short_term_pk(Welcome, PK, {_, SK}) ->
